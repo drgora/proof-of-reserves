@@ -1,0 +1,48 @@
+# Runs the full proof-of-reserves stack (ZK / hidden-balance flow).
+#   cp .env.example .env  &&  edit ZERION_API_KEY  &&  docker compose up --build
+# Then open http://localhost:5173 (browser needs MetaMask).
+
+services:
+  # Separate, content-blind notary (its own signing key).
+  notary:
+    build: { context: ., dockerfile: Dockerfile }
+    image: por-rust
+    command: zerion_notary
+    environment:
+      NOTARY_ADDR: 0.0.0.0:7150
+      RUST_LOG: info
+
+  # Independent relying-party verifier (checks the ZK proof + notary sig offline).
+  verifier:
+    build: { context: ., dockerfile: Dockerfile }
+    image: por-rust
+    command: por_verifier
+    environment:
+      POR_LISTEN_ADDR: 0.0.0.0:8080
+      POR_REQUIRED_THRESHOLD: ${POR_REQUIRED_THRESHOLD:-1000000}
+      RUST_LOG: "info,tlsn=warn"
+    depends_on: [notary]
+
+  # SIWE-gated prover (holds the Zerion key; proves balance >= T in ZK).
+  service:
+    build: { context: ., dockerfile: Dockerfile }
+    image: por-rust
+    command: por_service
+    environment:
+      ZERION_API_KEY: ${ZERION_API_KEY:?set ZERION_API_KEY in .env}
+      NOTARY_ADDR: notary:7150
+      VERIFIER_URL: http://verifier:8080/verify
+      POR_LISTEN_ADDR: 0.0.0.0:8090
+      POR_ADMIN_MODE: ${POR_ADMIN_MODE:-}   # set =1 in .env for local admin testing
+      RUST_LOG: "info,tlsn=warn"
+    ports: ["8090:8090"]      # published for direct debugging (synthtest.mjs)
+    depends_on: [notary, verifier]
+
+  # Frontend (Vite dev server; proxies /api -> service:8090).
+  web:
+    build: { context: ./app/web, dockerfile: Dockerfile }
+    image: por-web
+    environment:
+      API_PROXY: http://service:8090
+    ports: ["5173:5173"]
+    depends_on: [service]
