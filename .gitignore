@@ -1,5 +1,4 @@
 # Rust build output
-/por/target
 /por-zk/target
 
 # Noir build intermediates — but KEEP the compiled circuit (included via include_str!)

@@ -14,12 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY por ./por
 COPY por-zk ./por-zk
-# Non-ZK crate: just the separate notary.
-RUN cargo build --release --manifest-path por/Cargo.toml --bin zerion_notary
-# ZK crate: the independent verifier + the SIWE-gated prover (heavy).
-RUN cargo build --release --manifest-path por-zk/Cargo.toml --bin por_verifier --bin por_service
+# Everything lives in the ZK crate now: the separate notary, the independent
+# verifier, and the SIWE-gated prover (heavy — pulls noir-rs + Barretenberg).
+RUN cargo build --release --manifest-path por-zk/Cargo.toml \
+        --bin zerion_notary --bin por_verifier --bin por_service
 
 FROM debian:trixie-slim AS runtime
 # Runtime libs (incl. Barretenberg's). If a binary fails at startup on a missing
@@ -27,7 +26,7 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 libstdc++6 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/por/target/release/zerion_notary   /usr/local/bin/zerion_notary
+COPY --from=build /src/por-zk/target/release/zerion_notary /usr/local/bin/zerion_notary
 COPY --from=build /src/por-zk/target/release/por_verifier  /usr/local/bin/por_verifier
 COPY --from=build /src/por-zk/target/release/por_service   /usr/local/bin/por_service
 CMD ["zerion_notary"]

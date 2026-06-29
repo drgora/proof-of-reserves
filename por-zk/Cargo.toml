@@ -46,8 +46,13 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# The agent CLI, the relying-party REST verifier, the SIWE-gated proving
-# service, and two no-network self-tests. (Dev/demo bins were dropped.)
+# The separate notary, the agent CLI, the relying-party REST verifier, the
+# SIWE-gated proving service, and two no-network self-tests. (The reveal-balance
+# flow that used to live in the sibling `por/` crate was dropped.)
+[[bin]]
+name = "zerion_notary"
+path = "zerion_notary.rs"
+
 [[bin]]
 name = "por_prove"
 path = "por_prove.rs"

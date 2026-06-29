@@ -10,21 +10,18 @@ A **proof-of-reserves framework**: a trading agent proves it controls a wallet (
 
 Everything here is ours. **tlsn is a pinned *git dependency*, not vendored** — `github.com/tlsnotary/tlsn` at rev `0fe3c32d35382b3f290a43c4156399ca4512bb89` (the alpha `Session`/driver API), declared in both crates' `Cargo.toml`. Cargo fetches it into its own cache.
 
-- **`por/`** — the non-ZK / **reveal-balance** flow + the notary. Standalone crate; bins auto-discovered from `por/src/bin/`:
-  - `zerion_notary` — the **separate notary** (own signing key; also adds the signed `por.recv_commitments` + `por.siwe` attestation extensions the ZK flow relies on).
-  - `zerion_attest_{prove,present,verify}` — the separate-notary **attestation** flow (reveal-balance).
-  - `por_service` — a SIWE-gated REST service that proves + reveals the balance (the simpler variant).
-  - `zerion` — a one-shot in-process-notary plumbing PoC.
-- **`por-zk/`** — the **zero-knowledge** flow. **Standalone crate (its own lockfile + `[workspace]`)** because `noir-rs` pulls the noir-lang monorepo via git (~1 GB) + a heavy Barretenberg build. Bins: `por_prove` (agent CLI), `por_verifier` (independent REST verifier), `por_service` (**SIWE-gated ZK prover** serving the UI), `zk_selftest`/`siwe_selftest` (no-network tests). Shared modules: `por_core.rs` (prover), `por_zk.rs` (ZK helpers + REST wire types), `siwe_verify.rs` (manual EIP-191), `types.rs`. Circuit: `por-zk/noir/src/main.nr`, pre-compiled to `por-zk/noir/target/noir.json`. See `por-zk/POR_SERVICE.md`.
+- **`por-zk/`** — the **zero-knowledge** flow (balance never revealed) plus the notary it depends on. **Standalone crate (its own lockfile + `[workspace]`)** because `noir-rs` pulls the noir-lang monorepo via git (~1 GB) + a heavy Barretenberg build. Bins (explicit `[[bin]]` entries at the crate root):
+  - `zerion_notary` — the **separate notary** (own signing key; also adds the signed `por.recv_commitments` + `por.siwe` attestation extensions the ZK flow relies on). The notary doesn't touch noir/Barretenberg, but lives in this crate now (it built fast here regardless — deps are cached).
+  - `por_prove` (agent CLI), `por_verifier` (independent REST verifier), `por_service` (**SIWE-gated ZK prover** serving the UI), `zk_selftest`/`siwe_selftest` (no-network tests).
+  - Shared modules: `por_core.rs` (prover), `por_zk.rs` (ZK helpers + REST wire types), `siwe_verify.rs` (manual EIP-191), `types.rs`. Circuit: `por-zk/noir/src/main.nr`, pre-compiled to `por-zk/noir/target/noir.json`. See `por-zk/POR_SERVICE.md`.
+  - *(A sibling `por/` crate held the reveal-balance flow — `zerion_attest_*`, a balance-revealing `por_service`, and a `zerion` PoC. It was dropped; only its `zerion_notary` survived, moved here.)*
 - **`app/web/`** — React + wagmi/viem + `siwe` frontend (Vite). Calls the prover service over `/api/*`.
 
 ## Build
 
 Toolchain: **rustc ≥ 1.95** (this alpha requires it). Node 22.
 
-- **`por/`** (fast-ish; first build fetches tlsn from git + compiles it):
-  `cargo build --release --manifest-path por/Cargo.toml`
-- **`por-zk/`** (heavy: ~1 GB `noir-rs` git fetch + Barretenberg; **separate lockfile/target**):
+- **`por-zk/`** (heavy: ~1 GB `noir-rs` git fetch + Barretenberg; **separate lockfile/target**) — builds the notary, prover, verifier and self-tests:
   `cargo build --release --manifest-path por-zk/Cargo.toml`
 - **Frontend:** `npm --prefix app/web install`, then `npm --prefix app/web run dev` (Vite :5173, proxies `/api` → :8090) or `run build`.
 - The Noir circuit is pre-compiled. To change it you need **`nargo` pinned to `1.0.0-beta.19`** (`noirup --version 1.0.0-beta.19`) — `noir-rs` can't consume bytecode from another compiler.
@@ -34,7 +31,7 @@ Toolchain: **rustc ≥ 1.95** (this alpha requires it). Node 22.
 
 **The product (ZK, balance hidden) — 4 processes:**
 ```bash
-por/target/release/zerion_notary                                             # notary  :7150  (NOTARY_ADDR)
+por-zk/target/release/zerion_notary                                          # notary  :7150  (NOTARY_ADDR)
 POR_REQUIRED_THRESHOLD=1000000 por-zk/target/release/por_verifier             # verifier :8080
 ZERION_API_KEY=<key> NOTARY_ADDR=127.0.0.1:7150 \
   VERIFIER_URL=http://127.0.0.1:8080/verify POR_LISTEN_ADDR=127.0.0.1:8090 \
@@ -43,7 +40,7 @@ npm --prefix app/web run dev                                                 # U
 ```
 Browser w/ MetaMask → threshold → Prove. The Zerion API key lives **only** in the prover service's env.
 
-**Simpler flows:** `por/target/release/zerion` (one-shot plumbing, reveals data, redacts the key); the `zerion_attest_*` trio against `zerion_notary` (reveal-balance attestation); `por-zk/target/release/por_prove` CLI (writes `por.bundle.json`, prints a `curl` to `por_verifier`'s `/verify`).
+**CLI flow (still ZK):** `por-zk/target/release/por_prove` writes `por.bundle.json` and prints a `curl` to `por_verifier`'s `/verify` — same hidden-balance proof as the service, without the browser/SIWE front end.
 
 ## Tests / self-checks
 

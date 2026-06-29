@@ -6,8 +6,8 @@ balance**, and a REST service verifies that claim **offline**.
 This builds on:
 - the `≥T` Noir circuit (`noir/src/main.nr`) — proves `floor(balance) ≥ T` and
   that the balance commits to a SHA256 hash, in zero knowledge;
-- the separate-notary **attestation** flow (`crates/examples/zerion_attest`) —
-  a content-blind notary signs a commitment to the TLS transcript.
+- the separate **notary** (`zerion_notary`, in this crate) — a content-blind
+  notary signs a commitment to the TLS transcript.
 
 ## Trust model
 
@@ -52,7 +52,7 @@ All paths relative to the repo root `…/proof-of-reserves/tlsn`.
 **1. Notary** (separate trust domain; own signing key):
 ```bash
 NOTARY_ADDR=127.0.0.1:7150 RUST_LOG=info \
-  cargo run --release -p tlsn-examples --example zerion_notary
+  cargo run --release --manifest-path por-zk/Cargo.toml --bin zerion_notary
 ```
 
 **2. Verifier REST service:**
