@@ -1,0 +1,89 @@
+use dep::keccak256::keccak256;
+
+use crate::chain::{ETHEREUM_MAINNET_ID, ETHEREUM_SEPOLIA_ID};
+use crate::header::{BlockHeaderPartial, BlockHeaderRlp};
+use crate::misc::{arrays::sub_array_equals, fragment::Fragment};
+use crate::rlp::decode::decode_list;
+use crate::rlp::types::RlpList;
+
+global MAX_HEADER_FIELDS_COUNT: u32 = 21; // 20 (Cancun) + 1 (Prague EIP-7685 requestsHash)
+global STATE_ROOT_INDEX: u32 = 3;
+global TRANSACTIONS_ROOT_INDEX: u32 = 4;
+global RECEIPTS_ROOT_INDEX: u32 = 5;
+global BLOCK_NUM_INDEX: u32 = 8;
+
+pub(crate) global LONDON_BLOCK_NUM: u64 = 12_965_000;
+pub(crate) global PARIS_BLOCK_NUM: u64 = 15_537_394;
+pub(crate) global CANCUN_BLOCK_NUM: u64 = 19_426_587;
+// Prague (Pectra, EIP-7685) appends `requestsHash` -> 21 header fields. Mainnet
+// activation measured empirically: block 22_431_083 has 20 fields, 22_431_084 has 21.
+pub(crate) global PRAGUE_BLOCK_NUM: u64 = 22_431_084;
+
+pub(crate) fn get_header_fields_count(chain_id: u32, block_number: u64) -> u32 {
+    let mut fields_count = 15;
+    if chain_id == ETHEREUM_MAINNET_ID {
+        if block_number >= LONDON_BLOCK_NUM {
+            fields_count += 1;
+        }
+        if block_number >= PARIS_BLOCK_NUM {
+            fields_count += 1;
+        }
+        if block_number >= CANCUN_BLOCK_NUM {
+            fields_count += 3;
+        }
+        if block_number >= PRAGUE_BLOCK_NUM {
+            fields_count += 1;
+        }
+    } else if chain_id == ETHEREUM_SEPOLIA_ID {
+        // post cancun
+        fields_count = 20;
+    } else {
+        assert(false, "Unsupported chain ID");
+    }
+    fields_count
+}
+
+pub fn verify_header(
+    chain_id: u32,
+    block_header_partial: BlockHeaderPartial,
+    block_header_rlp: BlockHeaderRlp,
+) {
+    let block_header_rlp = Fragment::from_vec(block_header_rlp);
+    let header_rlp_list: RlpList<MAX_HEADER_FIELDS_COUNT> = decode_list(block_header_rlp);
+    let expected_header_fields_count =
+        get_header_fields_count(chain_id, block_header_partial.number);
+
+    assert(
+        expected_header_fields_count == header_rlp_list.len(),
+        "number of header RLP fields does not match",
+    );
+    header_rlp_list.get(BLOCK_NUM_INDEX).assert_eq_value(
+        "Block number",
+        block_header_rlp,
+        block_header_partial.number,
+    );
+    header_rlp_list.get(STATE_ROOT_INDEX).assert_eq_value(
+        "State root",
+        block_header_rlp,
+        block_header_partial.state_root,
+    );
+    header_rlp_list.get(TRANSACTIONS_ROOT_INDEX).assert_eq_value(
+        "Transactions root",
+        block_header_rlp,
+        block_header_partial.transactions_root,
+    );
+    header_rlp_list.get(RECEIPTS_ROOT_INDEX).assert_eq_value(
+        "Receipts root",
+        block_header_rlp,
+        block_header_partial.receipts_root,
+    );
+
+    assert(
+        sub_array_equals(
+            keccak256(block_header_rlp.data, block_header_rlp.length as u32),
+            block_header_partial.hash,
+            0,
+        ),
+        "block hash does not match",
+    );
+}

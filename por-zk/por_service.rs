@@ -19,6 +19,7 @@
 //   [POR_ADMIN_MODE=1]  RUST_LOG=info  cargo run --release --bin por_service
 
 mod por_core;
+mod por_witness;
 mod por_zk;
 mod siwe_verify;
 mod types;
@@ -239,7 +240,7 @@ async fn run_proof(
     state: &AppState,
     wallet: String,
     threshold: u64,
-    exts: Vec<Extension>,
+    _exts: Vec<Extension>,
 ) -> Result<VerifyResponse, ApiError> {
     let notary_stream = tokio::net::TcpStream::connect(&state.notary_addr)
         .await
@@ -248,14 +249,20 @@ async fn run_proof(
 
     // por_core::prove drives the tlsn MPC, whose future is !Send; run it on a
     // blocking thread so this axum handler's future stays Send.
-    let auth_b64 = state.auth_b64.clone();
-    let (presentation, zk) = tokio::task::spawn_blocking(move || {
+    let address = parse_addr20(&wallet).map_err(|e| ApiError::bad(format!("bad address: {e}")))?;
+    // TODO(Phase 5): derive Owner::PreSigned from the wallet's personal_sign(block_hash)
+    // via a block_hash round-trip. For now the service proves in DEBUG mode (the
+    // verifier rejects debug != 0 unless POR_ALLOW_DEBUG), so this path is not yet
+    // a valid production proof — the SIWE check above still gates access.
+    let (presentation, zk, _block) = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(por_core::prove(
             notary_stream,
-            &wallet,
-            threshold,
-            auth_b64,
-            exts,
+            por_core::DEFAULT_RPC_HOST,
+            address,
+            threshold as u128,
+            por_core::ETHEREUM_MAINNET_CHAIN_ID,
+            por_core::Owner::Debug,
+            None,
         ))
     })
     .await
@@ -289,6 +296,16 @@ async fn submit_to_verifier(
     let resp = client.request(request).await?;
     let bytes = resp.into_body().collect().await?.to_bytes();
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn parse_addr20(s: &str) -> anyhow::Result<[u8; 20]> {
+    let bytes = hex::decode(s.trim_start_matches("0x"))?;
+    if bytes.len() != 20 {
+        anyhow::bail!("address must be 20 bytes, got {}", bytes.len());
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&bytes);
+    Ok(a)
 }
 
 fn decode_sig(s: &str) -> Result<Vec<u8>, ApiError> {

@@ -1,15 +1,22 @@
 // Proof-of-reserves PROVER CLI (thin wrapper over `por_core`).
 //
-// Runs MPC-TLS to live api.zerion.io with a SEPARATE notary, produces a
-// { presentation, zk_proof } bundle proving floor(balance) >= THRESHOLD, and
-// writes it to disk for submission to `por_verifier`.
+// Proves that an Ethereum address holds >= THRESHOLD wei at a recent finalized
+// block, via MPC-TLS `debug_getRawHeader` to an RPC (attested by a SEPARATE
+// notary) + an `eth_getProof` state proof verified in zero knowledge. Writes a
+// { presentation, zk_proof } bundle for `por_verifier`. Balance and address stay
+// hidden.
 //
-// Run (after starting `zerion_notary` from crates/examples):
-//   ZERION_API_KEY=...  ZERION_WALLET=0x...  THRESHOLD=1000000 \
-//   NOTARY_ADDR=127.0.0.1:7150  RUST_LOG=info \
-//     cargo run --release --bin por_prove
+// Run (after starting `zerion_notary`):
+//   POR_ADDRESS=0x... THRESHOLD=1000000000000000000 \
+//   NOTARY_ADDR=127.0.0.1:7150 [POR_PRIVKEY=0x..] [RPC_HOST=eth.drpc.org] \
+//   RUST_LOG=info  cargo run --release --bin por_prove
+//
+// With POR_PRIVKEY set, the CLI signs personal_sign(block_hash) to prove ownership
+// of POR_ADDRESS in-circuit; without it, the proof is generated in DEBUG mode
+// (ownership check skipped — the verifier will reject it unless POR_ALLOW_DEBUG).
 
 mod por_core;
+mod por_witness;
 mod por_zk;
 mod types;
 
@@ -17,7 +24,8 @@ use std::env;
 
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tracing::info;
+use por_core::Owner;
+use tracing::{info, warn};
 
 const BUNDLE_PATH: &str = "por.bundle.json";
 
@@ -26,40 +34,63 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let notary_addr = env::var("NOTARY_ADDR").unwrap_or_else(|_| "127.0.0.1:7150".into());
-    let wallet = env::var("ZERION_WALLET")
-        .unwrap_or_else(|_| "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".into());
-    let threshold: u64 = env::var("THRESHOLD")
+    let rpc_host = env::var("RPC_HOST").unwrap_or_else(|_| por_core::DEFAULT_RPC_HOST.into());
+    let address = parse_hex_array::<20>(
+        &env::var("POR_ADDRESS").map_err(|_| anyhow!("set POR_ADDRESS=0x... (20-byte account)"))?,
+    )?;
+    let threshold: u128 = env::var("THRESHOLD")
         .ok()
         .map(|t| t.parse())
         .transpose()
-        .map_err(|e| anyhow!("invalid THRESHOLD: {e}"))?
-        .unwrap_or(1_000_000);
+        .map_err(|e| anyhow!("invalid THRESHOLD (wei): {e}"))?
+        .unwrap_or(1);
 
-    let auth_b64 = env::var("ZERION_API_KEY")
-        .map(|k| BASE64.encode(format!("{k}:")))
-        .unwrap_or_default();
-    if auth_b64.is_empty() {
-        return Err(anyhow!("set ZERION_API_KEY (need a 200 with a balance)"));
-    }
+    let owner = match env::var("POR_PRIVKEY") {
+        Ok(k) => Owner::LocalKey(parse_hex_array::<32>(&k)?),
+        Err(_) => {
+            warn!("no POR_PRIVKEY set -> DEBUG mode (ownership check skipped)");
+            Owner::Debug
+        }
+    };
 
     info!("connecting to notary at {notary_addr}");
     let notary_stream = tokio::net::TcpStream::connect(&notary_addr).await?;
     notary_stream.set_nodelay(true)?;
 
-    let (presentation, zk) =
-        por_core::prove(notary_stream, &wallet, threshold, auth_b64, Vec::new()).await?;
+    let (presentation, zk, block) = por_core::prove(
+        notary_stream,
+        &rpc_host,
+        address,
+        threshold,
+        por_core::ETHEREUM_MAINNET_CHAIN_ID,
+        owner,
+        None,
+    )
+    .await?;
 
     let request = por_zk::ProofRequest {
         presentation_b64: BASE64.encode(bincode::serialize(&presentation)?),
         zk_proof_b64: BASE64.encode(bincode::serialize(&zk)?),
-        required_threshold: Some(threshold),
+        required_threshold: None,
     };
     tokio::fs::write(BUNDLE_PATH, serde_json::to_vec_pretty(&request)?).await?;
 
-    println!("\n✅ Proof bundle written to `{BUNDLE_PATH}` (proves balance >= {threshold} USD).");
+    println!(
+        "\n✅ Proof bundle written to `{BUNDLE_PATH}` (proves balance >= {threshold} wei at block {block})."
+    );
     println!("Submit it to the verifier service:\n");
     println!("  curl -s -X POST http://127.0.0.1:8080/verify \\");
     println!("       -H 'content-type: application/json' \\");
     println!("       --data @{BUNDLE_PATH} | jq\n");
     Ok(())
+}
+
+fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(s.trim_start_matches("0x"))?;
+    if bytes.len() != N {
+        return Err(anyhow!("expected {N} bytes, got {}", bytes.len()));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }

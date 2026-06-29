@@ -1,0 +1,81 @@
+use crate::account::{
+    Account, MAX_ACCOUNT_LEAF_LEN, MAX_ACCOUNT_STATE_LEN, MAX_PREFIXED_KEY_NIBBLE_LEN,
+};
+use crate::HASH_LEN;
+use crate::merkle_patricia_proofs::proof::{ProofInput, verify_merkle_proof};
+use crate::misc::{bytes::right_pad, fragment::Fragment, types::{Address, ADDRESS_LENGTH}};
+use crate::rlp::decode::decode_list_of_small_strings;
+use crate::rlp::types::RlpList;
+
+use dep::keccak256::keccak256;
+
+global ACCOUNT_FIELDS_COUNT: u32 = 4;
+global NONCE_INDEX: u32 = 0;
+global BALANCE_INDEX: u32 = 1;
+global STORAGE_ROOT_INDEX: u32 = 2;
+global CODE_HASH_INDEX: u32 = 3;
+
+pub(crate) fn assert_account_equals(
+    account_rlp_left_padded: [u8; MAX_ACCOUNT_STATE_LEN],
+    account: Account,
+) {
+    let account_rlp_right_padded = right_pad(account_rlp_left_padded).storage();
+    let account_rlp_list: RlpList<ACCOUNT_FIELDS_COUNT> =
+        decode_list_of_small_strings(Fragment::from_array(account_rlp_right_padded));
+    assert(
+        account_rlp_list.len() == ACCOUNT_FIELDS_COUNT,
+        "Invalid number of fields in account RLP",
+    );
+
+    let account_rlp = Fragment::from_array(account_rlp_right_padded);
+    account_rlp_list.get(NONCE_INDEX).assert_eq_value("Nonce", account_rlp, account.nonce);
+    // SOUNDNESS FIX (PoR audit 2026-06-29): `balance` is an unbounded Field, but the
+    // RLP check below compares only `balance as u128` (a silently-wrapping cast), so
+    // upstream it constrained `balance` only mod 2^128 - a prover could output
+    // `true_balance + k*2^128` and pass any threshold. Range-check the full width so
+    // the cast is lossless and `balance` is pinned exactly. ETH balances << 2^128 wei.
+    account.balance.assert_max_bit_size::<128>();
+    account_rlp_list.get(BALANCE_INDEX).assert_eq_value(
+        "Balance",
+        account_rlp,
+        account.balance as u128,
+    );
+
+    account_rlp_list.get(STORAGE_ROOT_INDEX).assert_eq_value(
+        "Storage root",
+        account_rlp,
+        account.storage_root,
+    );
+    account_rlp_list.get(CODE_HASH_INDEX).assert_eq_value(
+        "Code hash",
+        account_rlp,
+        account.code_hash,
+    );
+}
+
+fn assert_address_equals(address_hash: [u8; MAX_PREFIXED_KEY_NIBBLE_LEN], address: Address) {
+    let address_hash_fragment = Fragment::new(
+        MAX_PREFIXED_KEY_NIBBLE_LEN - HASH_LEN,
+        HASH_LEN,
+        address_hash,
+    );
+    let other_address_hash_fragment =
+        Fragment::from_array(keccak256(address, ADDRESS_LENGTH as u32));
+    assert(address_hash_fragment.eq(other_address_hash_fragment), "Address mismatch");
+}
+
+pub fn verify_account<let MAX_DEPTH_NO_LEAF: u32>(
+    address: Address,
+    account: Account,
+    state_proof_input: ProofInput<MAX_PREFIXED_KEY_NIBBLE_LEN, MAX_ACCOUNT_STATE_LEN, MAX_DEPTH_NO_LEAF, MAX_ACCOUNT_LEAF_LEN>,
+    state_root: [u8; HASH_LEN],
+) {
+    assert_address_equals(state_proof_input.key, address);
+    assert_account_equals(state_proof_input.value, account);
+    verify_merkle_proof(
+        state_proof_input.key,
+        state_proof_input.value,
+        state_root,
+        state_proof_input.proof,
+    );
+}

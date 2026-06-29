@@ -118,6 +118,19 @@ pub fn generate_proof(
     Ok(ZKProofBundle { vk, proof })
 }
 
+/// Prove with a pre-built flat witness (ABI-ordered decimal strings) for the
+/// state-proof circuit (see `por_witness::build_witness`). The balance and address
+/// live inside the witness and are never exposed.
+pub fn prove_witness(witness: Vec<String>) -> Result<ZKProofBundle> {
+    let bytecode = bytecode()?;
+    let refs: Vec<&str> = witness.iter().map(String::as_str).collect();
+    let wmap = from_vec_str_to_witness_map(refs).map_err(|e| anyhow!(e))?;
+    setup_srs_from_bytecode(&bytecode, None, false).map_err(|e| anyhow!(e))?;
+    let vk = get_ultra_honk_verification_key(&bytecode, false).map_err(|e| anyhow!(e))?;
+    let proof = prove_ultra_honk(&bytecode, wmap, vk.clone(), false).map_err(|e| anyhow!(e))?;
+    Ok(ZKProofBundle { vk, proof })
+}
+
 /// Public inputs decoded from a proof: the proven threshold and committed hash.
 pub struct ProofPublicInputs {
     pub threshold: u64,
