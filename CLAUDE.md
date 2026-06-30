@@ -8,7 +8,7 @@ A **proof-of-reserves framework**: a trading agent proves it controls a wallet *
 
 The balance is read **directly from on-chain state**, not an API: an EIP-1186 `eth_getProof` account proof verified against the `state_root` in the block header. A **Risc0 zkVM** receipt shows, in one proof: the account-state Merkle-Patricia proof verifies under the header's state root, `balance ≥ threshold`, and (unless a public `debug` flag is set) **in-circuit secp256k1 ownership** of the address — with balance + address kept private. The journal commits only `{block_hash, threshold, chain_id, debug}`.
 
-Authenticity is anchored on `block_hash`: a verifier binds `keccak256(attested_header) == journal.block_hash`. In the intended design the attested header comes from a **TLSNotary (MPC-TLS)** presentation proving a *named RPC* served it (zkTLS) — so neither the agent nor the RPC can forge the state. **That TLSNotary attestation is not yet wired into the Risc0 flow** (the host currently fetches from the RPC with plain `curl`); the notary + MPC-TLS machinery lives in `por-zk/` as reference.
+Authenticity is anchored on `block_hash`: the verifier binds `keccak256(attested_header) == journal.block_hash`. The attested header comes from a **TLSNotary (MPC-TLS)** presentation proving a *named RPC* (drpc) served it (zkTLS) — so neither the agent nor the RPC can forge the state. This is **wired**: the host MPC-TLS-attests `debug_getRawHeader(N)` to drpc via a separate notary and bundles the `Presentation` into `proof.json`; `por_verify` verifies it (notary sig + Mozilla cert chain + drpc Host allowlist) and binds the attested header to the receipt. Only the **header** is attested — the `eth_getProof` is self-verifying against the header's `state_root` in-circuit, so it needs no attestation.
 
 > History: this evolved from an earlier design that read balances from the **Zerion API** and proved the threshold with a **Noir/UltraHonk** circuit. Both were dropped — Zerion → on-chain state proofs, Noir → Risc0 (the Risc0 receipt verifies on **zkVerify** with no version coupling, unlike UltraHonk's bb/Noir version pinning). Decision history + measured findings live in the project memory.
 
@@ -20,8 +20,10 @@ Authenticity is anchored on `block_hash`: a verifier binds `keccak256(attested_h
   - `host/src/main.rs` (bin `host`) — prover. Fetches `eth_getProof` + `debug_getRawHeader` from drpc (`curl`), builds the witness, proves a **succinct** receipt, writes `proof.json` (the zkVerify/Kurier bundle: `proofType risc0` / `V3_0` / CBOR receipt / image_id / journal). Two modes:
     - **DEMO** (no key): proves the beacon deposit contract with `debug=true` (no private key for a contract).
     - **OWNERSHIP** (`POR_PRIVATE_KEY=<32B hex>`): derive the EOA, fetch *its* proof, sign EIP-191(`block_hash`), prove `debug=false`.
-    - Env: `POR_THRESHOLD` (wei, default 1 ETH), `POR_SEGMENT_PO2` (segment size; default 20).
-  - `host/src/bin/por_verify.rs` — independent verifier. Verifies the receipt against the guest ID, decodes the journal, **binds** `keccak256(attested header) == journal.block_hash`, and enforces policy (reject `debug != 0` unless `POR_ALLOW_DEBUG`, `threshold ≥ POR_REQUIRED_THRESHOLD`, `chain_id == 1`).
+    - **TLSNotary**: if `NOTARY_ADDR` is set, MPC-TLS-attests `debug_getRawHeader(N)` to drpc via the notary and bundles the `Presentation` into `proof.json` (`src/attest.rs`, a noir-free port of por-zk's `por_core`); unset → dev mode (no presentation).
+    - Env: `POR_THRESHOLD` (wei, default 1 ETH), `POR_SEGMENT_PO2` (segment size; default 20), `NOTARY_ADDR` (notary TCP addr → enables attestation).
+  - `host/src/bin/notary.rs` (bin `notary`) — the **TLSNotary notary** (own secp256k1 key persisted to `notary-signing-key.bin`; a separate trust domain). Co-runs the MPC-TLS session and signs the attestation. Port of por-zk's `zerion_notary`, reusing por-risc0's compiled tlsn.
+  - `host/src/bin/por_verify.rs` — independent verifier (unified). Verifies the receipt against the guest ID, decodes the journal, and **binds** `keccak256(attested header) == journal.block_hash`, where the attested header comes from the bundled TLSNotary `Presentation` (verified: notary sig + Mozilla cert chain + drpc Host allowlist; the header is recovered from the revealed response) — or a dev-only by-hash re-fetch if no presentation. Then enforces policy (reject `debug != 0` unless `POR_ALLOW_DEBUG`, `threshold ≥ POR_REQUIRED_THRESHOLD`, `chain_id == 1`).
   - `host/src/bin/ownership_selftest.rs` — synthetic-state self-test of the `debug=false` ownership path (positive + negative controls; `POR_SELFTEST_PROVE=1` also produces a real receipt).
   - `methods/guest/src/main.rs` — the guest: `extract_state_root` (alloy-rlp header walk to item 3) → `verify_proof` (alloy-trie `TrieAccount` MPT) → ownership (`k256` ecrecover, unless `debug`) → `balance ≥ threshold` → commit `{block_hash, threshold, chain_id, debug}`. **Accelerated precompiles**: k256 + keccak via the risc0 forks (see gotchas).
   - `cudacheck.c` / `cudacheck_dl.c` — CUDA bring-up probes. `[features] cuda` enables GPU proving (see GPU gotcha).
@@ -41,16 +43,18 @@ Toolchain: **rustc ≥ 1.95** (the tlsn alpha, for `por-zk`) + the **Risc0 toolc
 
 ## Run
 
-**The product (Risc0, balance + address hidden):**
+**The product (Risc0 + TLSNotary, balance + address hidden):**
 ```bash
-# Prove (DEMO: beacon contract, debug=true) -> proof.json
-por-risc0/target/release/host
-# Prove (OWNERSHIP: a funded EOA you hold the key for, debug=false)
-POR_PRIVATE_KEY=<32B-hex> POR_THRESHOLD=<wei> por-risc0/target/release/host
-# Verify proof.json + bind block_hash (a debug=true receipt needs POR_ALLOW_DEBUG=1)
+# 1. Notary (separate trust domain) on :7150
+NOTARY_ADDR=127.0.0.1:7150 por-risc0/target/release/notary &
+# 2. Prove + MPC-TLS-attest (DEMO: beacon contract, debug=true) -> proof.json (+ presentation)
+NOTARY_ADDR=127.0.0.1:7150 por-risc0/target/release/host
+#    OWNERSHIP variant: a funded EOA you hold the key for, debug=false
+POR_PRIVATE_KEY=<32B-hex> POR_THRESHOLD=<wei> NOTARY_ADDR=127.0.0.1:7150 por-risc0/target/release/host
+# 3. Verify receipt + TLSNotary presentation + binding (debug=true receipt needs POR_ALLOW_DEBUG=1)
 POR_REQUIRED_THRESHOLD=<wei> por-risc0/target/release/por_verify
 ```
-Two things are **not done yet**: (1) **TLSNotary attestation of the RPC** — `host` uses plain `curl`, and `por_verify` re-fetches the header by hash as a dev stand-in for the real TLSNotary presentation; (2) **zkVerify submission via Kurier** (deferred — needs a testnet key). CPU proving is ~265 s (debug) / ~300–530 s (ownership, depending on MPT depth).
+Omit `NOTARY_ADDR` for a dev run (no attestation; `por_verify` falls back to a by-hash header re-fetch). The only piece still **not wired** is **zkVerify submission via Kurier** (deferred — needs a testnet key). CPU proving is ~265 s (debug) / ~300–530 s (ownership). The first `--release` build now also compiles the tlsn/MPC-TLS stack alongside risc0 (heavier, one-time).
 
 ## Tests / self-checks
 
@@ -76,8 +80,11 @@ The Risc0 proof says "balance ≥ T under this `block_hash`"; the attestation sa
 - `eth_getProof` uses minimal hex — odd-nibble values like `"0x0"` exist; left-pad before `hex::decode` (the `hexb` helper).
 - `por_verify`'s balance-leak privacy check guards `balance != 0` (a zero balance serializes to 16 zero bytes == a public `threshold=0`).
 
-**TLSNotary (`por-zk` reference; and when wiring it into Risc0):**
-- **Don't fork tlsn.** It's a pinned git dep. Surface verifier-visible data via a **notary-signed attestation extension** (as `por.recv_commitments` does), read from `PresentationOutput.extensions`.
+**TLSNotary (wired into `por-risc0`; the notary port + fuller reference also live in `por-zk`):**
+- **tlsn + risc0 dep trees coexist** in `por-risc0/host` (de-risked: both compile + link in one crate) — that's why the unified verifier is possible.
+- **Only the header is attested.** The MPC-TLS session attests `debug_getRawHeader(N)`; the `eth_getProof` is *self-verifying* against the header's `state_root` in-circuit, so it needs no attestation. Pin a **finalized** block so the attested header is byte-identical to the one proven.
+- **drpc is TLSNotary-compatible** (measured): it negotiates TLS 1.2 + `ECDHE-ECDSA-AES128-GCM-SHA256` with an **ECDSA P-256** cert — the alpha's only supported suite.
+- **Don't fork tlsn.** It's a pinned git dep. Surface verifier-visible data via a **notary-signed attestation extension** (as `por.recv_commitments` does), read from `PresentationOutput.extensions`. (The Risc0 verifier instead reads the *revealed* transcript via `PresentationOutput.transcript` + `received_unsafe()` and keccaks the header.)
 - **tlsn MPC futures are `!Send`** — inside an axum handler run via `spawn_blocking(|| Handle::current().block_on(...))`.
 - **Commitments** default to BLAKE3 (set SHA256); a hash commitment opens whole.
 - **SIWE is manual EIP-191** (k256 + tiny-keccak), not the `siwe` crate (dep conflict); the frontend uses the `siwe` npm package only to *build* the message.

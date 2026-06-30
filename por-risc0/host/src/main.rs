@@ -14,6 +14,9 @@ use serde_json::Value;
 use std::{fs::File, io::Write, process::Command, time::Instant};
 use alloy_primitives::keccak256;
 use k256::ecdsa::SigningKey;
+use base64::Engine as _;
+
+mod attest;
 
 const RPC_URL: &str = "https://eth.drpc.org";
 const ADDR: &str = "0x00000000219ab540356cBB839Cbe05303d7705Fa"; // beacon deposit contract
@@ -39,7 +42,8 @@ fn hexb(s: &str) -> Vec<u8> {
 fn h32(s: &str) -> [u8; 32] { let v = hexb(s); let mut a = [0u8; 32]; a[32 - v.len()..].copy_from_slice(&v); a }
 fn hu128(s: &str) -> u128 { let v = hexb(s); let mut a = [0u8; 16]; a[16 - v.len()..].copy_from_slice(&v); u128::from_be_bytes(a) }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
@@ -102,6 +106,25 @@ fn main() {
         eprintln!("WARNING: balance < threshold; the guest will reject this proof");
     }
 
+    // TLSNotary attestation of the header (MPC-TLS to drpc via the notary). NOTARY_ADDR
+    // set => attest debug_getRawHeader(block) and bundle the presentation; unset => dev
+    // mode (proof.json without attestation; por_verify falls back to a by-hash re-fetch).
+    // Done BEFORE the slow prove so a notary failure surfaces fast.
+    let presentation_b64: Option<String> = match std::env::var("NOTARY_ADDR") {
+        Ok(addr) => {
+            println!("attesting debug_getRawHeader({block_hex}) to eth.drpc.org via notary {addr} ...");
+            let bytes = attest::attest_header(&addr, "eth.drpc.org", &block_hex)
+                .await
+                .expect("TLSNotary attestation failed");
+            println!("  attestation OK: {} byte presentation", bytes.len());
+            Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+        }
+        Err(_) => {
+            println!("NOTARY_ADDR unset -> skipping TLSNotary attestation (dev mode)");
+            None
+        }
+    };
+
     // Segment size. Default po2=20 = risc0's default (CPU prover; ~265 s baseline).
     // Lower via POR_SEGMENT_PO2 for small-VRAM GPUs: the 8 GB RTX 3070 Laptop needed
     // <=15 to avoid OOM (impractically many segments) -> CPU stays the primary prover;
@@ -142,11 +165,15 @@ fn main() {
     let mut cbor = Vec::new();
     ciborium::into_writer(&receipt, &mut cbor).unwrap();
     let image_id = hex::encode(POR_GUEST_ID.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-    let proof_json = serde_json::json!({
+    let mut proof_json = serde_json::json!({
         "proofType": "risc0", "proofOptions": { "version": "V3_0" },
         "proofData": { "proof": format!("0x{}", hex::encode(&cbor)),
             "vk": format!("0x{image_id}"), "publicSignals": format!("0x{}", hex::encode(j)) }
     });
+    if let Some(p) = presentation_b64 {
+        proof_json["tlsnPresentation"] = serde_json::Value::String(p);
+        println!("bundled TLSNotary presentation into proof.json");
+    }
     File::create("proof.json").unwrap()
         .write_all(serde_json::to_string_pretty(&proof_json).unwrap().as_bytes()).unwrap();
     println!("wrote proof.json: CBOR receipt {} bytes, journal {} bytes", cbor.len(), j.len());
