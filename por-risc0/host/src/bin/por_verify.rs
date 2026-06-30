@@ -14,6 +14,7 @@ use methods::POR_GUEST_ID;
 use risc0_zkvm::Receipt;
 use serde_json::Value;
 use std::process::Command;
+use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 
 use base64::Engine as _;
@@ -114,6 +115,79 @@ fn verify_presentation(b64: &str, journal_block_hash: &[u8; 32]) {
     );
 }
 
+// --- Kurier / zkVerify on-chain submission (the relying party settles on-chain only
+// what it has already verified locally) ---
+
+fn curl(args: &[&str]) -> Vec<u8> {
+    Command::new("curl").args(args).output().expect("curl").stdout
+}
+
+// Submit the locally-verified risc0 receipt to Kurier for on-chain verification on
+// zkVerify, then poll job-status to inclusion. proof.json's proofData is already in the
+// required shape (proof = hex CBOR receipt, vk = hex image_id [LE words], publicSignals =
+// hex journal); risc0 needs no VK pre-registration. Gated on KURIER_API_KEY.
+fn submit_to_kurier(bundle: &Value) {
+    let Ok(api_key) = std::env::var("KURIER_API_KEY") else {
+        println!("[5] KURIER_API_KEY unset -> on-chain submission skipped (local verification only)");
+        return;
+    };
+    let base = std::env::var("KURIER_API_URL")
+        .unwrap_or_else(|_| "https://api-testnet.kurier.xyz".into());
+
+    let mut payload = serde_json::json!({
+        "proofType": bundle["proofType"],       // "risc0"
+        "vkRegistered": false,                   // risc0 uses the image_id directly as vk
+        "proofOptions": bundle["proofOptions"],  // { "version": "V3_0" }
+        "proofData": bundle["proofData"],        // { proof, vk, publicSignals }
+    });
+    if let Ok(chain) = std::env::var("KURIER_CHAIN_ID") {
+        if let Ok(n) = chain.parse::<u64>() { payload["chainId"] = serde_json::json!(n); }
+    }
+
+    println!("[5] submitting risc0 receipt to Kurier ({base}) ...");
+    let submit_url = format!("{base}/submit-proof/{api_key}");
+    let body = payload.to_string();
+    let out = curl(&["-s", "-X", "POST", "-H", "content-type: application/json",
+                     "--data", &body, &submit_url]);
+    let resp: Value = serde_json::from_slice(&out).unwrap_or_else(|_| {
+        eprintln!("    Kurier response was not JSON: {}", String::from_utf8_lossy(&out));
+        std::process::exit(3);
+    });
+    if resp.get("jobId").is_none() {
+        eprintln!("[5] Kurier rejected the submission: {resp}");
+        std::process::exit(3);
+    }
+    if let Some(ov) = resp.get("optimisticVerify").and_then(|v| v.as_str()) {
+        println!("    optimisticVerify: {ov}");
+    }
+    let job_id = resp["jobId"].as_str().unwrap().to_string();
+    println!("    jobId {job_id} -- polling for on-chain inclusion ...");
+
+    let status_url = format!("{base}/job-status/{api_key}/{job_id}");
+    for _ in 0..120 {
+        std::thread::sleep(Duration::from_secs(5));
+        let s = curl(&["-s", &status_url]);
+        let sj: Value = match serde_json::from_slice(&s) { Ok(v) => v, Err(_) => continue };
+        let status = sj.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+        println!("    status: {status}");
+        match status {
+            "Finalized" | "Aggregated" | "IncludedInBlock" => {
+                println!("\n[5] ON-CHAIN VERIFIED on zkVerify (status={status})");
+                if let Some(tx) = sj.get("txHash").and_then(|v| v.as_str()) { println!("    txHash:    {tx}"); }
+                if let Some(bh) = sj.get("blockHash").and_then(|v| v.as_str()) { println!("    blockHash: {bh}"); }
+                return;
+            }
+            "Failed" | "Error" | "Invalid" => {
+                eprintln!("[5] ON-CHAIN VERIFICATION FAILED: {sj}");
+                std::process::exit(3);
+            }
+            _ => {} // Submitted / Pending / ... -> keep polling
+        }
+    }
+    eprintln!("[5] timed out waiting for on-chain inclusion (job {job_id})");
+    std::process::exit(3);
+}
+
 fn main() {
     // ---- load + verify the Risc0 receipt ----
     let bundle: Value =
@@ -158,5 +232,9 @@ fn main() {
     assert_eq!(chain_id, 1, "unexpected chain_id");
     println!("[4] POLICY OK: debug={debug}, threshold {threshold} >= {required}, chain_id {chain_id}");
 
-    println!("\nVERIFIED \u{2713} -- reserves bound to block 0x{} (balance & address hidden)", hex::encode(block_hash));
+    println!("\nLOCAL VERIFICATION \u{2713} -- reserves bound to block 0x{} (balance & address hidden)", hex::encode(block_hash));
+
+    // The relying party settles on-chain only what it has already verified: submit the
+    // receipt to zkVerify via Kurier (no-op unless KURIER_API_KEY is set).
+    submit_to_kurier(&bundle);
 }
