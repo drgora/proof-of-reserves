@@ -30,7 +30,7 @@ Authenticity is anchored on `block_hash`: the verifier binds `keccak256(attested
 - **`por-zk/`** — **trimmed TLSNotary reference** (source-only, ~200 K; builds without Barretenberg now).
   - Built bins: `zerion_notary` (the separate notary — own secp256k1 key; adds signed `por.recv_commitments` + `por.siwe` attestation extensions) and `siwe_selftest`.
   - Reference source only (no `[[bin]]`, not built): `por_core.rs` (MPC-TLS prover), `por_witness.rs`, `por_zk.rs`, `por_prove.rs`, `por_verifier.rs`, `por_service.rs`, `siwe_verify.rs`, `types.rs`. This is the reference for wiring TLSNotary attestation into the Risc0 flow. *(The Noir/UltraHonk circuit + the noir-rs/Barretenberg dep were removed when the ZK layer moved to Risc0.)*
-- **`app/web/`** — React + wagmi/viem + `siwe` frontend (Vite). It was built against `por-zk`'s `por_service` (now reference-only), so **it has no live backend** until a Risc0 service is built.
+- **`app/web/`** — React + Vite frontend, repurposed into a **read-only verified-agent directory** (list + per-agent detail) for the **Horizen Labs Agent Marketplace**. It reads from the marketplace's own MCP read API (`agent-registry.horizenlabs.io/api/mcp`) via a thin zero-dep Node read-proxy (`app/web/server.mjs`, `/api/agents`, `/api/agents/:id`, `/api/overview`) — the browser can't call the MCP endpoint directly (CORS-blocked + JSON-RPC). Themed with the zkVerify brand kit (Void/Signal/Pulse/Shell + Space Grotesk). The directory filters to **Proof-of-Reserves** agents (by receipt `proofType` via `POR_PROOF_TYPES`, or a `POR_AGENT_IDS` allowlist); until PoR is registered on the marketplace it runs in **preview mode** (shows all verified agents, banner). The proxy caches + backs off the registry's 240 req/min limit, and skips the expensive per-agent scan when no PoR proof type is live. See `app/web/README.md`. *(The old SIWE/`por_service` prove flow — `/api/nonce|prove` — is gone; wagmi/siwe deps remain installed but unused.)*
 
 ## Build
 
@@ -38,7 +38,7 @@ Toolchain: **rustc ≥ 1.95** (the tlsn alpha, for `por-zk`) + the **Risc0 toolc
 
 - **`por-risc0/` (active):** `cd por-risc0 && cargo build --release` (builds `host`, `por_verify`, `ownership_selftest`; the guest ELF builds via `risc0-build`). GPU: `--features cuda` (see GPU gotcha — CUDA 12.x + ≥16 GB VRAM).
 - **`por-zk/` (reference):** `cargo build --manifest-path por-zk/Cargo.toml` — builds `zerion_notary` + `siwe_selftest` (the tlsn/MPC-TLS stack is the bulk; no Barretenberg).
-- **Frontend:** `npm --prefix app/web install`, then `run dev` (Vite :5173, proxies `/api` → :8090) / `run build`.
+- **Frontend (verified-agent directory):** `npm --prefix app/web install`, then run **two** processes: `npm --prefix app/web run server` (the read-proxy on :8090) and `npm --prefix app/web run dev` (Vite :5173, proxies `/api` → :8090). `run build` for a static bundle. PoR filter via env on the proxy (`POR_AGENT_IDS` / `POR_PROOF_TYPES`); see `app/web/README.md`.
 - **Bumping the tlsn rev** means re-checking the API against the alpha — it changes shape between revs.
 
 ## Run

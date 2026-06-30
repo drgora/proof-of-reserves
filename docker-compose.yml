@@ -1,48 +1,56 @@
-# Runs the full proof-of-reserves stack (ZK / hidden-balance flow).
-#   cp .env.example .env  &&  edit ZERION_API_KEY  &&  docker compose up --build
-# Then open http://localhost:5173 (browser needs MetaMask).
+# Spins up the verified-agent directory web UI:
+#
+#   docker compose up --build      # then open http://localhost:5173
+#
+# Two containers, both from the same lightweight app/web image:
+#   readproxy — Node read-proxy (server.mjs) that wraps the HL Agent Marketplace
+#               MCP read API and exposes clean REST on :8090.
+#   web       — Vite frontend; its /api is proxied to readproxy:8090.
+#
+# No API key required to browse (it reads the public marketplace registry).
+# To filter the directory to your Proof-of-Reserves agents, set POR_AGENT_IDS
+# (and/or POR_PROOF_TYPES) in the environment / a .env file before `up`.
+#
+# NOTE: the PoR proving/verifying stack (por-risc0 prover, TLSNotary notary,
+# por_verify, Kurier→zkVerify settlement) is a separate concern and is NOT part
+# of this compose — the directory reads already-recorded validations from the
+# marketplace, it does not produce them.
 
 services:
-  # Separate, content-blind notary (its own signing key).
-  notary:
-    build: { context: ., dockerfile: Dockerfile }
-    image: por-rust
-    command: zerion_notary
+  # Read-proxy: browser-safe REST over the registry MCP (CORS-blocked + JSON-RPC).
+  readproxy:
+    build: { context: ./app/web, dockerfile: Dockerfile }
+    image: por-web
+    command: ["node", "server.mjs"]
     environment:
-      NOTARY_ADDR: 0.0.0.0:7150
-      RUST_LOG: info
+      PORT: 8090
+      REGISTRY_MCP_URL: ${REGISTRY_MCP_URL:-https://agent-registry.horizenlabs.io/api/mcp}
+      # PoR filter — see app/web/README.md. Defaults leave it in "preview mode"
+      # (all verified agents) until a PoR proof type / PoR agents exist.
+      POR_AGENT_IDS: ${POR_AGENT_IDS:-}
+      POR_PROOF_TYPES: ${POR_PROOF_TYPES:-proof-of-reserves,reserves,por,risc0}
+      POR_SHOW_ALL: ${POR_SHOW_ALL:-1}
+      ZKVERIFY_EXPLORER: ${ZKVERIFY_EXPLORER:-https://zkverify-testnet.subscan.io}
+    expose: ["8090"]
+    healthcheck:
+      # node:slim has no curl/wget; use Node's global fetch.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8090/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
-  # Independent relying-party verifier (checks the ZK proof + notary sig offline).
-  verifier:
-    build: { context: ., dockerfile: Dockerfile }
-    image: por-rust
-    command: por_verifier
-    environment:
-      POR_LISTEN_ADDR: 0.0.0.0:8080
-      POR_REQUIRED_THRESHOLD: ${POR_REQUIRED_THRESHOLD:-1000000}
-      RUST_LOG: "info,tlsn=warn"
-    depends_on: [notary]
-
-  # SIWE-gated prover (holds the Zerion key; proves balance >= T in ZK).
-  service:
-    build: { context: ., dockerfile: Dockerfile }
-    image: por-rust
-    command: por_service
-    environment:
-      ZERION_API_KEY: ${ZERION_API_KEY:?set ZERION_API_KEY in .env}
-      NOTARY_ADDR: notary:7150
-      VERIFIER_URL: http://verifier:8080/verify
-      POR_LISTEN_ADDR: 0.0.0.0:8090
-      POR_ADMIN_MODE: ${POR_ADMIN_MODE:-}   # set =1 in .env for local admin testing
-      RUST_LOG: "info,tlsn=warn"
-    ports: ["8090:8090"]      # published for direct debugging (synthtest.mjs)
-    depends_on: [notary, verifier]
-
-  # Frontend (Vite dev server; proxies /api -> service:8090).
+  # Frontend (Vite dev server; proxies /api -> readproxy:8090).
   web:
     build: { context: ./app/web, dockerfile: Dockerfile }
     image: por-web
+    # Force binding to 0.0.0.0 so Docker's published port can reach Vite inside
+    # the container (otherwise it only prints a `Local:` URL and the publish has
+    # nothing to forward to). --strictPort fails loudly instead of hopping ports.
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--strictPort"]
     environment:
-      API_PROXY: http://service:8090
+      API_PROXY: http://readproxy:8090
     ports: ["5173:5173"]
-    depends_on: [service]
+    depends_on:
+      readproxy:
+        condition: service_healthy
