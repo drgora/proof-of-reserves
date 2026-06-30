@@ -4,70 +4,85 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A **proof-of-reserves framework**: a trading agent proves it controls a wallet (SIWE) and holds **≥ T USD** of assets (read from the Zerion API) — and, in the ZK variant, proves the threshold **without revealing the balance**. Authenticity comes from **TLSNotary (MPC-TLS)**: a content-blind, independent notary attests the encrypted TLS session with `api.zerion.io`, so neither the agent nor the service can forge the balance.
+A **proof-of-reserves framework**: a trading agent proves it controls a wallet **and** holds **≥ T** of assets — **without revealing the balance or the address** (native ETH on L1 for v1).
+
+The balance is read **directly from on-chain state**, not an API: an EIP-1186 `eth_getProof` account proof verified against the `state_root` in the block header. A **Risc0 zkVM** receipt shows, in one proof: the account-state Merkle-Patricia proof verifies under the header's state root, `balance ≥ threshold`, and (unless a public `debug` flag is set) **in-circuit secp256k1 ownership** of the address — with balance + address kept private. The journal commits only `{block_hash, threshold, chain_id, debug}`.
+
+Authenticity is anchored on `block_hash`: a verifier binds `keccak256(attested_header) == journal.block_hash`. In the intended design the attested header comes from a **TLSNotary (MPC-TLS)** presentation proving a *named RPC* served it (zkTLS) — so neither the agent nor the RPC can forge the state. **That TLSNotary attestation is not yet wired into the Risc0 flow** (the host currently fetches from the RPC with plain `curl`); the notary + MPC-TLS machinery lives in `por-zk/` as reference.
+
+> History: this evolved from an earlier design that read balances from the **Zerion API** and proved the threshold with a **Noir/UltraHonk** circuit. Both were dropped — Zerion → on-chain state proofs, Noir → Risc0 (the Risc0 receipt verifies on **zkVerify** with no version coupling, unlike UltraHonk's bb/Noir version pinning). Decision history + measured findings live in the project memory.
 
 ## Layout
 
-Everything here is ours. **tlsn is a pinned *git dependency*, not vendored** — `github.com/tlsnotary/tlsn` at rev `0fe3c32d35382b3f290a43c4156399ca4512bb89` (the alpha `Session`/driver API), declared in both crates' `Cargo.toml`. Cargo fetches it into its own cache.
+**tlsn is a pinned *git dependency*, not vendored** — `github.com/tlsnotary/tlsn` rev `0fe3c32d35382b3f290a43c4156399ca4512bb89` (the alpha `Session`/driver API).
 
-- **`por-zk/`** — the **zero-knowledge** flow (balance never revealed) plus the notary it depends on. **Standalone crate (its own lockfile + `[workspace]`)** because `noir-rs` pulls the noir-lang monorepo via git (~1 GB) + a heavy Barretenberg build. Bins (explicit `[[bin]]` entries at the crate root):
-  - `zerion_notary` — the **separate notary** (own signing key; also adds the signed `por.recv_commitments` + `por.siwe` attestation extensions the ZK flow relies on). The notary doesn't touch noir/Barretenberg, but lives in this crate now (it built fast here regardless — deps are cached).
-  - `por_prove` (agent CLI), `por_verifier` (independent REST verifier), `por_service` (**SIWE-gated ZK prover** serving the UI), `zk_selftest`/`siwe_selftest` (no-network tests).
-  - Shared modules: `por_core.rs` (prover), `por_zk.rs` (ZK helpers + REST wire types), `siwe_verify.rs` (manual EIP-191), `types.rs`. Circuit: `por-zk/noir/src/main.nr`, pre-compiled to `por-zk/noir/target/noir.json`. See `por-zk/POR_SERVICE.md`.
-  - *(A sibling `por/` crate held the reveal-balance flow — `zerion_attest_*`, a balance-revealing `por_service`, and a `zerion` PoC. It was dropped; only its `zerion_notary` survived, moved here.)*
-- **`app/web/`** — React + wagmi/viem + `siwe` frontend (Vite). Calls the prover service over `/api/*`.
+- **`por-risc0/`** — **the active flow** (Risc0 zkVM; cargo-risczero layout, its own target).
+  - `host/src/main.rs` (bin `host`) — prover. Fetches `eth_getProof` + `debug_getRawHeader` from drpc (`curl`), builds the witness, proves a **succinct** receipt, writes `proof.json` (the zkVerify/Kurier bundle: `proofType risc0` / `V3_0` / CBOR receipt / image_id / journal). Two modes:
+    - **DEMO** (no key): proves the beacon deposit contract with `debug=true` (no private key for a contract).
+    - **OWNERSHIP** (`POR_PRIVATE_KEY=<32B hex>`): derive the EOA, fetch *its* proof, sign EIP-191(`block_hash`), prove `debug=false`.
+    - Env: `POR_THRESHOLD` (wei, default 1 ETH), `POR_SEGMENT_PO2` (segment size; default 20).
+  - `host/src/bin/por_verify.rs` — independent verifier. Verifies the receipt against the guest ID, decodes the journal, **binds** `keccak256(attested header) == journal.block_hash`, and enforces policy (reject `debug != 0` unless `POR_ALLOW_DEBUG`, `threshold ≥ POR_REQUIRED_THRESHOLD`, `chain_id == 1`).
+  - `host/src/bin/ownership_selftest.rs` — synthetic-state self-test of the `debug=false` ownership path (positive + negative controls; `POR_SELFTEST_PROVE=1` also produces a real receipt).
+  - `methods/guest/src/main.rs` — the guest: `extract_state_root` (alloy-rlp header walk to item 3) → `verify_proof` (alloy-trie `TrieAccount` MPT) → ownership (`k256` ecrecover, unless `debug`) → `balance ≥ threshold` → commit `{block_hash, threshold, chain_id, debug}`. **Accelerated precompiles**: k256 + keccak via the risc0 forks (see gotchas).
+  - `cudacheck.c` / `cudacheck_dl.c` — CUDA bring-up probes. `[features] cuda` enables GPU proving (see GPU gotcha).
+- **`por-zk/`** — **trimmed TLSNotary reference** (source-only, ~200 K; builds without Barretenberg now).
+  - Built bins: `zerion_notary` (the separate notary — own secp256k1 key; adds signed `por.recv_commitments` + `por.siwe` attestation extensions) and `siwe_selftest`.
+  - Reference source only (no `[[bin]]`, not built): `por_core.rs` (MPC-TLS prover), `por_witness.rs`, `por_zk.rs`, `por_prove.rs`, `por_verifier.rs`, `por_service.rs`, `siwe_verify.rs`, `types.rs`. This is the reference for wiring TLSNotary attestation into the Risc0 flow. *(The Noir/UltraHonk circuit + the noir-rs/Barretenberg dep were removed when the ZK layer moved to Risc0.)*
+- **`app/web/`** — React + wagmi/viem + `siwe` frontend (Vite). It was built against `por-zk`'s `por_service` (now reference-only), so **it has no live backend** until a Risc0 service is built.
 
 ## Build
 
-Toolchain: **rustc ≥ 1.95** (this alpha requires it). Node 22.
+Toolchain: **rustc ≥ 1.95** (the tlsn alpha, for `por-zk`) + the **Risc0 toolchain** for the guest (`rzup`: cargo-risczero / r0vm **3.0.4** = zkVerify `V3_0`; `rzup install rust` if the guest toolchain is too old for alloy's deps). Node 22.
 
-- **`por-zk/`** (heavy: ~1 GB `noir-rs` git fetch + Barretenberg; **separate lockfile/target**) — builds the notary, prover, verifier and self-tests:
-  `cargo build --release --manifest-path por-zk/Cargo.toml`
-- **Frontend:** `npm --prefix app/web install`, then `npm --prefix app/web run dev` (Vite :5173, proxies `/api` → :8090) or `run build`.
-- The Noir circuit is pre-compiled. To change it you need **`nargo` pinned to `1.0.0-beta.19`** (`noirup --version 1.0.0-beta.19`) — `noir-rs` can't consume bytecode from another compiler.
-- **Bumping the tlsn rev** (both `Cargo.toml`s must match) means re-checking the API against this alpha — it changes shape between revs.
+- **`por-risc0/` (active):** `cd por-risc0 && cargo build --release` (builds `host`, `por_verify`, `ownership_selftest`; the guest ELF builds via `risc0-build`). GPU: `--features cuda` (see GPU gotcha — CUDA 12.x + ≥16 GB VRAM).
+- **`por-zk/` (reference):** `cargo build --manifest-path por-zk/Cargo.toml` — builds `zerion_notary` + `siwe_selftest` (the tlsn/MPC-TLS stack is the bulk; no Barretenberg).
+- **Frontend:** `npm --prefix app/web install`, then `run dev` (Vite :5173, proxies `/api` → :8090) / `run build`.
+- **Bumping the tlsn rev** means re-checking the API against the alpha — it changes shape between revs.
 
 ## Run
 
-**The product (ZK, balance hidden) — 4 processes:**
+**The product (Risc0, balance + address hidden):**
 ```bash
-por-zk/target/release/zerion_notary                                          # notary  :7150  (NOTARY_ADDR)
-POR_REQUIRED_THRESHOLD=1000000 por-zk/target/release/por_verifier             # verifier :8080
-ZERION_API_KEY=<key> NOTARY_ADDR=127.0.0.1:7150 \
-  VERIFIER_URL=http://127.0.0.1:8080/verify POR_LISTEN_ADDR=127.0.0.1:8090 \
-  por-zk/target/release/por_service                                          # prover  :8090
-npm --prefix app/web run dev                                                 # UI      :5173
+# Prove (DEMO: beacon contract, debug=true) -> proof.json
+por-risc0/target/release/host
+# Prove (OWNERSHIP: a funded EOA you hold the key for, debug=false)
+POR_PRIVATE_KEY=<32B-hex> POR_THRESHOLD=<wei> por-risc0/target/release/host
+# Verify proof.json + bind block_hash (a debug=true receipt needs POR_ALLOW_DEBUG=1)
+POR_REQUIRED_THRESHOLD=<wei> por-risc0/target/release/por_verify
 ```
-Browser w/ MetaMask → threshold → Prove. The Zerion API key lives **only** in the prover service's env.
-
-**CLI flow (still ZK):** `por-zk/target/release/por_prove` writes `por.bundle.json` and prints a `curl` to `por_verifier`'s `/verify` — same hidden-balance proof as the service, without the browser/SIWE front end.
+Two things are **not done yet**: (1) **TLSNotary attestation of the RPC** — `host` uses plain `curl`, and `por_verify` re-fetches the header by hash as a dev stand-in for the real TLSNotary presentation; (2) **zkVerify submission via Kurier** (deferred — needs a testnet key). CPU proving is ~265 s (debug) / ~300–530 s (ownership, depending on MPT depth).
 
 ## Tests / self-checks
 
-No conventional `cargo test` suite for the glue. Validate with:
-- `cd por-zk/noir && nargo test` — circuit tests (needs nargo `1.0.0-beta.19`).
-- `por-zk/target/release/zk_selftest` / `siwe_selftest` — no-network ZK and SIWE-recovery roundtrips.
-- `node app/web/synthtest.mjs` (with `BASE=http://127.0.0.1:8090`) — headless SIWE → `/api/prove` against a running service.
+- `por-risc0/target/release/ownership_selftest` — execution + negative controls for the `debug=false` ownership path; `POR_SELFTEST_PROVE=1` adds a real succinct prove (~5 min CPU).
+- `por-risc0/target/release/por_verify` — verifies a receipt + the `block_hash` binding (against a `proof.json`).
+- `por-zk/target/.../siwe_selftest` — SIWE EIP-191 recovery roundtrip.
 
-## Architecture & trust model (the big picture)
+## Architecture & trust model
 
-Three independent trust domains; understanding the system means seeing how they bind:
+Three independent trust domains, bound by **`block_hash`**:
+1. **Agent / prover** — holds the wallet key, fetches state from a named RPC, proves in Risc0 (balance + address private).
+2. **Notary** (TLSNotary, separate process, own key) — co-runs the RPC TLS session via MPC so session keys are **split**; signs a commitment to the *encrypted* transcript, never sees plaintext, cannot forge it. *(Reference in `por-zk`; not yet integrated into the Risc0 flow.)*
+3. **Verifier** (independent) — verifies the Risc0 receipt, binds `keccak256(attested header) == journal.block_hash`, enforces policy. In prod the header comes from the TLSNotary presentation (proving a named RPC served it); the cert identifies the *RPC*, not the chain, so chain identity rests on a Host allowlist + M-of-N RPC quorum.
 
-1. **Agent / prover** — holds the Zerion key, runs MPC-TLS to `api.zerion.io`.
-2. **Notary** (separate process, own secp256k1 key) — co-runs the TLS session via MPC so the session keys are **split**; signs a commitment to the *encrypted* transcript and **never sees plaintext or the balance**, and cannot forge it. (This is why TLSNotary, not a proxy-attestor scheme where the attestor signs the *value*.)
-3. **Verifier** (independent, offline REST) — checks notary signature + server cert chain (Mozilla roots) + the ZK proof.
-
-**Binding the ZK proof to the attested data without forking tlsn:** the balance is SHA256-committed inside the attestation; a Noir/UltraHonk proof shows `floor(balance) ≥ T` against that commitment. This alpha only exposes commitments publicly in the *interactive* flow, so the **notary adds a signed `Extension` (`por.recv_commitments`)** carrying its received-side commitments; the verifier reads it via the public `PresentationOutput.extensions`, matches the proof's `committed_hash` to it, and thus binds proof ↔ attested transcript. SIWE ownership is bound the same way (a signed `por.siwe` extension). `por_service` (`por-zk/`) verifies the SIWE personal_sign, derives the wallet, and proves for it.
+The Risc0 proof says "balance ≥ T under this `block_hash`"; the attestation says "a named RPC served the header whose keccak == `block_hash`."
 
 ## Critical gotchas (these will bite)
 
-- **Don't fork tlsn for verifier-visible data.** It's a pinned git dep. If the verifier seems to need a `pub(crate)` tlsn field, surface it via a **notary-signed attestation extension** instead (as `por.recv_commitments` does).
-- **tlsn MPC futures are `!Send`.** Inside an axum handler, run the prover via `tokio::task::spawn_blocking(|| Handle::current().block_on(...))` — otherwise the handler fails axum's `Handler` bound with an opaque error.
-- **Commitment mechanics:** `TranscriptCommitConfigBuilder` defaults to **BLAKE3** (set SHA256). `reveal_*` requires revealed ⊆ committed ranges, and a **hash commitment opens whole** — to keep the balance hidden, only fully-open committed ranges that are **disjoint** from the balance value.
-- **Barretenberg SRS:** call `setup_srs_from_bytecode(...)` once per process before `get_ultra_honk_verification_key`/`verify_ultra_honk` — the separate verifier process needs it too.
-- **SIWE verification is manual EIP-191** (k256 + tiny-keccak), not the `siwe` crate (its deps conflict). The frontend uses the `siwe` npm package to *build* the message.
-- **Zerion specifics:** serves **TLS 1.2 + `ECDHE-ECDSA-AES128-GCM-SHA256`** (TLSNotary's only supported suite). Balance is `data.attributes.total.positions` (USD). Keyless → **HTTP 402** (x402 / Machine Payments Protocol); a valid key → 200; an invalid key → 401. Responses are `Transfer-Encoding: chunked`. Always send `Accept-Encoding: identity` (TLSNotary can't handle compression). Demo keys are ~1 req/s, 300/day.
+**Risc0 flow (`por-risc0`):**
+- **Accelerated precompiles** (`methods/guest/Cargo.toml` `[patch.crates-io]` + `risc0-zkvm`/`risc0-build` `unstable` feature): k256 = risc0 fork `k256/v0.13.4-risczero.1` (needs the risc0 `crypto-bigint` fork); keccak = risc0 `tiny-keccak` fork — alloy's keccak backend, so all MPT/header keccak is accelerated. alloy's `native-keccak` hook does **not** link on risc0; don't use it.
+- **Prague header has 21 fields** (Cancun 20): `extract_state_root` reads item index 3 (`state_root`, stable across forks); the guest keccaks the whole header for `block_hash`.
+- **GPU (`--features cuda`)**: needs **CUDA 12.x** (risc0 3.0.4 rejects CUDA 13). Pass `-arch=sm_XX` **explicitly** via `NVCC_PREPEND_FLAGS` (`-arch=native` mis-detects in a chroot → slow `sm_52`). On glibc ≥2.41, patch CUDA's `crt/math_functions.h` (`throw()` on the 6 C23 math decls). **An 8 GB GPU OOMs** (only fits at `po2≤15` → impractically many segments); a **≥16 GB** card is the real requirement. In a chroot where `cuInit` returns 304, **build in the chroot, run the binary on the host**.
+- `eth_getProof` uses minimal hex — odd-nibble values like `"0x0"` exist; left-pad before `hex::decode` (the `hexb` helper).
+- `por_verify`'s balance-leak privacy check guards `balance != 0` (a zero balance serializes to 16 zero bytes == a public `threshold=0`).
+
+**TLSNotary (`por-zk` reference; and when wiring it into Risc0):**
+- **Don't fork tlsn.** It's a pinned git dep. Surface verifier-visible data via a **notary-signed attestation extension** (as `por.recv_commitments` does), read from `PresentationOutput.extensions`.
+- **tlsn MPC futures are `!Send`** — inside an axum handler run via `spawn_blocking(|| Handle::current().block_on(...))`.
+- **Commitments** default to BLAKE3 (set SHA256); a hash commitment opens whole.
+- **SIWE is manual EIP-191** (k256 + tiny-keccak), not the `siwe` crate (dep conflict); the frontend uses the `siwe` npm package only to *build* the message.
+- **RPC / TLSNotary specifics**: TLSNotary supports only **TLS 1.2 + `ECDHE-ECDSA-AES128-GCM-SHA256`**; always send `Accept-Encoding: identity` (it can't handle compression). drpc serves `debug_getRawHeader` (accepts a block **hash**) and `eth_getProof`.
 
 ## Further context
 
-`por-zk/POR_SERVICE.md` documents the REST product, its trust model, and what `/verify` checks. Project decision history and measured findings live in the Claude Code project memory.
+`por-zk/POR_SERVICE.md` documents the (now-reference) TLSNotary REST flow. The current architecture's decision history + measured findings (Risc0 perf, GPU bring-up, ownership E2E, the `por-zk` trim, the zkVerify/Kurier gap) live in the Claude Code project memory.

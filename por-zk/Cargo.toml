@@ -4,8 +4,9 @@ name = "por-zk"
 publish = false
 version = "0.1.0"
 
-# Standalone (its own lockfile + workspace) because `noir-rs` pulls the
-# noir-lang monorepo via git (~1 GB) and a heavy Barretenberg build.
+# Standalone (its own lockfile + workspace). Trimmed to the TLSNotary-reference
+# pieces; the heavy noir-rs/Barretenberg dependency was removed when the ZK layer
+# moved to ../por-risc0 (Risc0). Now builds fast (no Barretenberg).
 [workspace]
 
 [dependencies]
@@ -27,9 +28,6 @@ http-body-util = "0.1"
 hyper = { version = "1.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["full"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
-noir = { git = "https://github.com/zkmopro/noir-rs", tag = "v1.0.0-beta.19", features = [
-  "barretenberg",
-] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
@@ -46,44 +44,16 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# The separate notary, the agent CLI, the relying-party REST verifier, the
-# SIWE-gated proving service, and two no-network self-tests. (The reveal-balance
-# flow that used to live in the sibling `por/` crate was dropped.)
+# Trimmed to the TLSNotary-reference pieces that build WITHOUT noir-rs/Barretenberg:
+# the separate notary + the SIWE EIP-191 self-test. The Noir/UltraHonk ZK layer moved
+# to ../por-risc0, so its prover bins (por_prove/por_verifier/por_service/zk_selftest)
+# were dropped; the prover-side SOURCE — por_core.rs / por_witness.rs / por_zk.rs /
+# por_prove.rs / por_verifier.rs / por_service.rs — is KEPT as TLSNotary reference but
+# is no longer built (no [[bin]] entry, so cargo ignores it).
 [[bin]]
 name = "zerion_notary"
 path = "zerion_notary.rs"
 
 [[bin]]
-name = "por_prove"
-path = "por_prove.rs"
-
-[[bin]]
-name = "por_verifier"
-path = "por_verifier.rs"
-
-[[bin]]
-name = "por_service"
-path = "por_service.rs"
-
-[[bin]]
-name = "zk_selftest"
-path = "zk_selftest.rs"
-
-[[bin]]
 name = "siwe_selftest"
 path = "siwe_selftest.rs"
-
-# TEMPORARY Phase-0.2 measurement harness (remove after de-risk).
-[[bin]]
-name = "por_gatecheck"
-path = "por_gatecheck.rs"
-
-# TEMPORARY: EIP-191 ownership test-vector generator (remove after de-risk).
-[[bin]]
-name = "por_sigvec"
-path = "por_sigvec.rs"
-
-# TEMPORARY: witness-builder roundtrip test (remove after de-risk).
-[[bin]]
-name = "por_witnesstest"
-path = "por_witnesstest.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "methods"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+# 'unstable' lets the guest build use the accelerated keccak coprocessor + k256 precompile.
+risc0-build = { version = "^3.0.4", features = ["unstable"] }
+
+[package.metadata.risc0]
+methods = ["guest"]
