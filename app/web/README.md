@@ -35,6 +35,81 @@ npm run dev      # terminal 2 — Vite on :5173 (proxies /api → :8090)
 `npm run build` produces a static bundle in `dist/`; serve it behind any host that
 proxies `/api` to a running `server.mjs`.
 
+## Local testing with a mock registry
+
+The live registry is rate-limited, CORS-blocked, and (until PoR is registered)
+has no Proof-of-Reserves agents — so it can't exercise the `por`-mode filter or a
+real end-to-end submission. `mock-registry.mjs` is a zero-dep, **stateful**
+stand-in that plays **two roles** in one process:
+
+1. **Registry read MCP** — the `tools/call` slice the proxy uses, served from
+   mutable state (seeded with two PoR agents + two non-PoR agents).
+2. **Kurier stand-in** — the exact endpoints `por_verify` hits
+   (`POST /submit-proof/:key`, `GET /job-status/:key/:jobId`), so the **real
+   `por_verify` binary submits its real receipt here with no code changes**.
+
+The bridge: when a submitted receipt reaches `Aggregated`, the mock **auto-records
+a validation** on the prover's agent, which then appears in the UI. (This collapses
+the marketplace's on-chain steps — attestation relay + `ValidationGateway.record‑
+Validation` — which need Base Sepolia + viem and can't run locally.)
+
+### Full E2E: proof → submission → UI
+
+```bash
+# terminal 1 — mock (registry MCP + Kurier + control), all on :8091
+npm run mock
+# terminal 2 — read-proxy on :8090, pointed at the mock (short cache TTLs so new
+#              validations show up on refresh within a few seconds)
+npm run server:mock
+# terminal 3 — Vite on :5173
+npm run dev
+# open http://localhost:5173  → `por` mode, 2 PoR agents; the "Local Reserve
+#   Prover (this node)" agent is registered but NOT yet shown (0 receipts).
+
+# terminal 4 — submit a REAL receipt from por-risc0/ (uses the existing proof.json)
+cd ../../por-risc0
+KURIER_API_KEY=mock KURIER_API_URL=http://127.0.0.1:8091 \
+  POR_ALLOW_DEBUG=1 POR_REQUIRED_THRESHOLD=1 ./target/release/por_verify
+#   → por_verify verifies locally, submits to the mock Kurier, polls to
+#     "Aggregated". Refresh the UI: the self-agent now appears with its receipt,
+#     whose zkVerify txHash matches por_verify's output and whose ethBlockHash is
+#     the actual block the reserves were proven against.
+```
+
+To make a *fresh* proof first, run the prover (`host`) per the top-level README,
+then submit as above. `npm run server:mock` is `npm run server` with
+`REGISTRY_MCP_URL`, `POR_PROOF_TYPES=proof-of-reserves,risc0`, and short cache TTLs
+prepended.
+
+> Requires a `por_verify` built from this branch — it now streams the (~0.5 MB)
+> receipt to `curl` over stdin instead of an inline argv (which overflowed
+> `ARG_MAX`). Rebuild with `cargo build --release --bin por_verify` in `por-risc0/`.
+
+### Control API (interactive)
+
+| Endpoint | Does |
+|----------|------|
+| `GET /mock/state` | dump agents (receipts, verified, target) + open Kurier jobs. |
+| `POST /mock/reset` | restore the seed fixtures (clears recorded validations). |
+| `POST /mock/target` `{agentId}` | set which agent Kurier submissions attribute to. |
+| `POST /mock/agent` `{agentId?,name,proofType,…,makeTarget?}` | register/upsert an agent. |
+| `POST /mock/record` `{agentId?,proofType?,ethBlockHash?}` | inject a validation **without** running the prover (fast UI iteration). |
+
+### Read-side modes you can also exercise
+
+| Want | Do |
+|------|----|
+| `por` mode | default — overview advertises `risc0`, proxy runs the scan, keeps the PoR agents. |
+| `allowlist` mode | `POR_AGENT_IDS=0x1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d,0x9f8e7d6c5b4a3928176554433221100ffeeddccb npm run server:mock`. |
+| `fallback-all` / preview banner | start the mock with `MOCK_POR_LIVE=0 npm run mock`. |
+| 404 path | `GET /api/agents/0xnope` → 404. |
+
+Mock env: `MOCK_PORT` (default `8091`), `MOCK_POR_LIVE` (default `1`),
+`MOCK_SELF_AGENT_ID` / `MOCK_SELF_AGENT_NAME` (the submission-target agent),
+`MOCK_KURIER_POLLS` (default `0`; intermediate `AggregationPending` polls before
+`Aggregated` — raise to watch the lifecycle). Edit the `SEED_AGENTS` array in
+`mock-registry.mjs` to change the fixture set.
+
 ## Configuring the Proof-of-Reserves filter
 
 The directory shows only agents that have proven **Proof-of-Reserves**. Until a PoR

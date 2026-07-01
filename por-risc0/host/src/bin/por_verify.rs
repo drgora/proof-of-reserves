@@ -13,7 +13,8 @@
 use methods::POR_GUEST_ID;
 use risc0_zkvm::Receipt;
 use serde_json::Value;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tiny_keccak::{Hasher, Keccak};
 
@@ -122,6 +123,21 @@ fn curl(args: &[&str]) -> Vec<u8> {
     Command::new("curl").args(args).output().expect("curl").stdout
 }
 
+// POST a JSON body via stdin (`--data-binary @-`). The receipt bundle is ~0.5 MB,
+// which blows past ARG_MAX if passed as an inline `--data` argv (E2BIG), so the
+// body must go over stdin.
+fn curl_post_json(url: &str, body: &str) -> Vec<u8> {
+    let mut child = Command::new("curl")
+        .args(["-s", "-X", "POST", "-H", "content-type: application/json",
+               "--data-binary", "@-", url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("curl");
+    child.stdin.take().expect("curl stdin").write_all(body.as_bytes()).expect("write curl stdin");
+    child.wait_with_output().expect("curl").stdout
+}
+
 // Submit the locally-verified risc0 receipt to Kurier for on-chain verification on
 // zkVerify, then poll job-status to inclusion. proof.json's proofData is already in the
 // required shape (proof = hex CBOR receipt, vk = hex image_id [LE words], publicSignals =
@@ -147,8 +163,7 @@ fn submit_to_kurier(bundle: &Value) {
     println!("[5] submitting risc0 receipt to Kurier ({base}) ...");
     let submit_url = format!("{base}/submit-proof/{api_key}");
     let body = payload.to_string();
-    let out = curl(&["-s", "-X", "POST", "-H", "content-type: application/json",
-                     "--data", &body, &submit_url]);
+    let out = curl_post_json(&submit_url, &body);
     let resp: Value = serde_json::from_slice(&out).unwrap_or_else(|_| {
         eprintln!("    Kurier response was not JSON: {}", String::from_utf8_lossy(&out));
         std::process::exit(3);
