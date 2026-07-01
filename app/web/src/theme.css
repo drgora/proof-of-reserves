@@ -559,3 +559,215 @@ table.receipts tr:last-child td {
   gap: 8px 18px;
   align-items: center;
 }
+
+/* ---------------- Network badge ---------------- */
+.badge.net {
+  color: var(--signal);
+  background: var(--signal-soft);
+  border: 1px solid rgba(92, 114, 255, 0.35);
+}
+
+.hero-top {
+  margin-bottom: 14px;
+}
+
+/* detail sub-row: agent id + marketplace link */
+.detail-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-top: 2px;
+}
+.marketplace-link {
+  font-size: 13px;
+}
+
+/* ---------------- Submission pipeline ---------------- */
+.pipeline-section {
+  margin-top: 30px;
+}
+.section-sub {
+  margin: -4px 0 14px;
+  color: var(--muted);
+  font-size: 14px;
+  max-width: 720px;
+  line-height: 1.5;
+}
+.pipeline {
+  display: grid;
+  gap: 12px;
+}
+.pipe-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--signal);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.pipe-card.done {
+  border-left-color: var(--pulse);
+}
+.pipe-card.failed {
+  border-left-color: var(--fail);
+}
+.pipe-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.pipe-title {
+  font-weight: 700;
+  font-size: 15px;
+  word-break: break-word;
+}
+.pipe-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.pipe-stage {
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+.pipe-stage.active {
+  color: var(--signal);
+  background: var(--signal-soft);
+}
+.pipe-stage.done {
+  color: var(--pulse);
+  background: var(--pulse-soft);
+}
+.pipe-stage.failed {
+  color: var(--fail);
+  background: rgba(255, 122, 144, 0.12);
+}
+.pipe-when {
+  color: var(--muted-2);
+}
+
+.stepper {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  overflow-x: auto;
+}
+.step {
+  flex: 1 1 0;
+  min-width: 96px;
+  position: relative;
+  padding-top: 22px;
+  text-align: center;
+}
+.step .dot {
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 2px solid var(--border-strong);
+  z-index: 1;
+}
+.step::before {
+  content: '';
+  position: absolute;
+  top: 8px;
+  left: -50%;
+  width: 100%;
+  height: 2px;
+  background: var(--border);
+}
+.step:first-child::before {
+  display: none;
+}
+.step.done .dot {
+  background: var(--pulse);
+  border-color: var(--pulse);
+}
+.step.done::before {
+  background: var(--pulse);
+}
+.step.active .dot {
+  background: var(--signal);
+  border-color: var(--signal);
+  animation: pulse-dot 1.3s ease-in-out infinite;
+}
+.step.active::before {
+  background: linear-gradient(90deg, var(--pulse), var(--signal));
+}
+.step-label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.3;
+  padding: 0 4px;
+}
+.step.done .step-label,
+.step.active .step-label {
+  color: var(--text);
+}
+.step-detail {
+  display: block;
+  font-size: 11px;
+  margin-top: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@keyframes pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(92, 114, 255, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(92, 114, 255, 0);
+  }
+}
+.pipe-error {
+  margin-top: 12px;
+  color: #ffc2cc;
+  font-size: 13px;
+}
+
+/* ---------------- Footer (contracts) ---------------- */
+.site-footer .footer-cols {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+}
+.footer-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+}
+.footer-contracts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: center;
+}
+.footer-heading {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.contract {
+  color: var(--muted);
+  font-size: 12px;
+}
+.contract:hover {
+  color: var(--signal);
+}
+.contract .mono {
+  font-size: 11px;
+}

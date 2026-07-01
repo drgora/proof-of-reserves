@@ -1,20 +1,25 @@
 import { Link } from 'react-router-dom'
-import { useDirectory, useOverview } from '../hooks'
+import { useDirectory, useOverview, usePipeline } from '../hooks'
 import { fmtNum, fmtPct, timeAgo, type AgentRow, type DirectoryMode } from '../api'
-import { ErrorBox, Loading, PorBadge, TypeBadge, VerifiedBadge } from '../components'
+import { ErrorBox, Loading, NetworkBadge, PipelineTimeline, PorBadge, TypeBadge, VerifiedBadge } from '../components'
 
 export default function Directory() {
   const overview = useOverview()
   const dir = useDirectory()
+  const pipeline = usePipeline()
 
   const o = overview.data
   const d = dir.data
+  const p = pipeline.data
   const passRate =
     o && o.receipts.count ? Math.round((o.receipts.validated / o.receipts.count) * 100) : null
 
   return (
     <>
       <section className="hero">
+        <div className="hero-top">
+          <NetworkBadge network={d?.network} />
+        </div>
         <h1>
           Verified <span className="accent">Proof-of-Reserves</span> agents
         </h1>
@@ -24,6 +29,25 @@ export default function Directory() {
           verified on zkVerify and recorded on the Horizen Labs Agent Marketplace.
         </p>
       </section>
+
+      {p?.enabled && p.jobs.length > 0 && (
+        <section className="pipeline-section">
+          <div className="section-head">
+            <h2>Verification pipeline</h2>
+            <span className="count">live · this node</span>
+          </div>
+          <p className="section-sub">
+            Each proof travels Kurier → zkVerify → attestation relay → on-chain{' '}
+            <span className="mono">recordValidation</span> on Base Sepolia before it counts as a
+            receipt below.
+          </p>
+          <PipelineTimeline
+            jobs={p.jobs}
+            explorer={p.explorer || d?.explorer}
+            baseExplorer={p.baseExplorer || d?.baseExplorer}
+          />
+        </section>
+      )}
 
       <div className="statbar">
         <div className="stat">

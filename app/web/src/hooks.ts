@@ -14,3 +14,14 @@ export const useAgent = (id: string | undefined) =>
     enabled: !!id,
     staleTime: 30_000,
   })
+
+// The submission pipeline is live-polled (the skill recommends a 3–5s cadence
+// so users watch stages advance). It's gated server-side: when no submitter
+// status source is wired the proxy returns { enabled:false }, and this stays quiet.
+export const usePipeline = () =>
+  useQuery({
+    queryKey: ['pipeline'],
+    queryFn: api.pipeline,
+    refetchInterval: 3_000,
+    staleTime: 0,
+  })

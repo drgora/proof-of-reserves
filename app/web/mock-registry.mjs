@@ -78,6 +78,9 @@ function makeReceipts(agentId, proofType, { count, failed, curve, constraintCoun
         curve,
         constraintCount,
       },
+      // On-chain ValidationGateway.recordValidation on Base Sepolia (only for
+      // validations that were recorded — failed proofs never reach the gateway).
+      ...(isFail ? {} : { validationTxHash: fakeHash(`${agentId}:val:${i}`), validationId: 50_000 + (count - i) }),
     })
   }
   return items
@@ -258,6 +261,10 @@ function recordValidation(agentId, { fingerprint, proofType = 'risc0', ethBlockH
   const fp = fingerprint || sha256(`${id}:${a.receiptItems.length}:${Date.now()}`)
   const txHash = '0x' + fp.slice(0, 64)
   const blockHash = '0x' + sha256(fp + ':zkv-block').slice(0, 64)
+  // The Base Sepolia recordValidation tx + on-chain validation id (the marketplace's
+  // final on-chain step, collapsed here). Distinct from the zkVerify extrinsic above.
+  const validationTxHash = '0x' + sha256(fp + ':base-validation').slice(0, 64)
+  const validationId = 50_000 + a.receiptItems.length + 1
   const receipt = {
     id: `val-${fp.slice(0, 12)}`,
     status: 'validated',
@@ -265,6 +272,8 @@ function recordValidation(agentId, { fingerprint, proofType = 'risc0', ethBlockH
     proofType,
     timestamp: new Date().toISOString(),
     zkVerify: { txHash, blockHash, curve: 'risc0-succinct', constraintCount: 1 << 20 },
+    validationTxHash,
+    validationId,
     ethBlockHash, // extra: the ETH block the reserves were proven against (UI ignores unknown fields)
   }
   a.receiptItems.unshift(receipt)
@@ -272,7 +281,7 @@ function recordValidation(agentId, { fingerprint, proofType = 'risc0', ethBlockH
   recompute(a)
   console.log(`[mock] recorded ${proofType} validation on ${id} (now ${a.receiptItems.length} receipts)` +
     (ethBlockHash ? ` — reserves proven at ETH block ${ethBlockHash.slice(0, 12)}…` : ''))
-  return { receipt, txHash, blockHash }
+  return { receipt, txHash, blockHash, validationTxHash, validationId }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +452,15 @@ function kurierSubmit(body) {
   const fingerprint = sha256(body.proofData.publicSignals || body.proofData.proof)
   const ethBlockHash = decodeBlockHash(body.proofData.publicSignals)
   const jobId = `job-${(++state.jobSeq).toString().padStart(4, '0')}-${fingerprint.slice(0, 10)}`
-  state.jobs.set(jobId, { jobId, agentId: state.targetId, fingerprint, ethBlockHash, polls: 0, recorded: false })
+  // The zkVerify extrinsic hash is deterministic from the fingerprint, so we know
+  // it up front and can surface it at the FINALIZED stage before aggregation.
+  const zkvTxHash = '0x' + fingerprint.slice(0, 64)
+  const zkvBlockHash = '0x' + sha256(fingerprint + ':zkv-block').slice(0, 64)
+  const now = Date.now()
+  state.jobs.set(jobId, {
+    jobId, agentId: state.targetId, fingerprint, ethBlockHash, polls: 0, recorded: false,
+    zkvTxHash, zkvBlockHash, submittedAt: now, updatedAt: now, aggregatedAt: null,
+  })
   console.log(`[mock][kurier] submit accepted → ${jobId} (target agent ${state.targetId.slice(0, 12)}…)`)
   return { status: 200, body: { jobId, optimisticVerify: 'Verified' } }
 }
@@ -453,11 +470,12 @@ function kurierStatus(jobId) {
   const job = state.jobs.get(jobId)
   if (!job) return { status: 200, body: { status: 'Failed', error: `unknown job ${jobId}` } }
   job.polls++
+  job.updatedAt = Date.now()
   if (job.polls <= KURIER_POLLS) {
     return { status: 200, body: { status: 'AggregationPending', jobId } }
   }
   if (!job.recorded) {
-    const { txHash, blockHash } = recordValidation(job.agentId, {
+    const { txHash, blockHash, validationTxHash, validationId } = recordValidation(job.agentId, {
       fingerprint: job.fingerprint,
       proofType: 'risc0',
       ethBlockHash: job.ethBlockHash,
@@ -465,7 +483,10 @@ function kurierStatus(jobId) {
     job.recorded = true
     job.txHash = txHash
     job.blockHash = blockHash
+    job.validationTxHash = validationTxHash
+    job.validationId = validationId
     job.aggregationId = (state.jobSeq * 1000 + 22435) >>> 0
+    job.aggregatedAt = Date.now()
   }
   return {
     status: 200,
@@ -478,6 +499,52 @@ function kurierStatus(jobId) {
       aggregationDetails: { leaf: job.txHash, merkleProof: [], numberOfLeaves: 1, leafIndex: 0 },
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// Submission pipeline view (skill: "Persisting Pipeline State for UI Polling").
+// por_verify stops polling Kurier at "Aggregated", so the post-aggregation
+// on-chain steps (relay → recordValidation → confirmed) are animated lazily off
+// wall-clock time since aggregation — the UI polls /mock/pipeline every ~3s and
+// watches the stepper advance SUBMITTED → … → VERIFIED.
+// ---------------------------------------------------------------------------
+
+const PIPE_ORDER = ['SUBMITTED', 'FINALIZED', 'AGGREGATED', 'RELAYING', 'RECORDING', 'VERIFIED']
+
+/** Derive the current pipeline stage + revealed tracking fields for a job. */
+function jobPipeline(job) {
+  let stage
+  if (!job.recorded) {
+    stage = job.polls > 0 ? 'FINALIZED' : 'SUBMITTED'
+  } else {
+    const dt = Date.now() - (job.aggregatedAt || Date.now())
+    stage = dt >= 9000 ? 'VERIFIED' : dt >= 6000 ? 'RECORDING' : dt >= 3000 ? 'RELAYING' : 'AGGREGATED'
+  }
+  const at = (s) => PIPE_ORDER.indexOf(stage) >= PIPE_ORDER.indexOf(s)
+  const a = getAgent(job.agentId)
+  return {
+    jobId: job.jobId,
+    agentId: job.agentId,
+    agentName: a?.name,
+    stage,
+    submittedAt: new Date(job.submittedAt).toISOString(),
+    updatedAt: new Date(job.updatedAt || job.submittedAt).toISOString(),
+    zkVerifyJobId: job.jobId,
+    ...(at('FINALIZED') ? { zkVerifyExtrinsicHash: job.zkvTxHash, zkVerifyBlockHash: job.zkvBlockHash } : {}),
+    ...(at('AGGREGATED') && job.aggregationId != null ? { aggregationId: job.aggregationId } : {}),
+    ...(at('RECORDING') && job.validationTxHash ? { validationTxHash: job.validationTxHash, validationId: job.validationId } : {}),
+    ethBlockHash: job.ethBlockHash,
+    error: null,
+  }
+}
+
+/** Newest-first pipeline snapshot for the read-proxy / UI. */
+function pipelineSnapshot() {
+  const jobs = [...state.jobs.values()]
+    .sort((x, y) => (y.submittedAt || 0) - (x.submittedAt || 0))
+    .slice(0, 12)
+    .map(jobPipeline)
+  return { enabled: true, jobs }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +644,9 @@ const server = http.createServer(async (req, res) => {
     return json(res, r.status, r.body)
   }
 
+  // --- submission pipeline (polled by the read-proxy → UI) ---
+  if (req.method === 'GET' && p === '/mock/pipeline') return json(res, 200, pipelineSnapshot())
+
   // --- control API ---
   if (req.method === 'GET' && p === '/mock/state') return json(res, 200, stateSnapshot())
   if (req.method === 'POST' && p === '/mock/reset') {
@@ -596,10 +666,22 @@ const server = http.createServer(async (req, res) => {
   // Manually record a validation without running the prover (pure-UI iteration).
   if (req.method === 'POST' && p === '/mock/record') {
     const body = (await readBody(req)) || {}
-    const { receipt } = recordValidation(body.agentId || state.targetId, {
-      fingerprint: body.fingerprint,
+    const agentId = String(body.agentId || state.targetId).toLowerCase()
+    const fingerprint = body.fingerprint || sha256(`${agentId}:manual:${Date.now()}`)
+    const { receipt, txHash, blockHash, validationTxHash, validationId } = recordValidation(agentId, {
+      fingerprint,
       proofType: body.proofType || 'risc0',
       ethBlockHash: body.ethBlockHash || null,
+    })
+    // Seed a matching, already-complete pipeline entry so the pipeline panel has
+    // something to show without running por_verify end-to-end.
+    const jobId = `job-${(++state.jobSeq).toString().padStart(4, '0')}-${fingerprint.slice(0, 10)}`
+    const now = Date.now()
+    state.jobs.set(jobId, {
+      jobId, agentId, fingerprint, ethBlockHash: body.ethBlockHash || null, polls: 1, recorded: true,
+      zkvTxHash: txHash, zkvBlockHash: blockHash, txHash, blockHash, validationTxHash, validationId,
+      aggregationId: (state.jobSeq * 1000 + 22435) >>> 0,
+      submittedAt: now - 12_000, updatedAt: now, aggregatedAt: now - 10_000, // already VERIFIED
     })
     return json(res, 200, { ok: true, receipt })
   }
@@ -612,6 +694,7 @@ server.listen(PORT, () => {
   console.log(`[mock-registry] up on :${PORT} (registry MCP + Kurier + control), risc0 live: ${POR_LIVE}`)
   console.log(`[mock-registry]   registry MCP : POST ${base}/api/mcp   (point server.mjs here)`)
   console.log(`[mock-registry]   kurier       : POST ${base}/submit-proof/:key  ·  GET ${base}/job-status/:key/:jobId`)
+  console.log(`[mock-registry]   pipeline     : GET ${base}/mock/pipeline   (point PIPELINE_URL here)`)
   console.log(`[mock-registry]   control      : GET ${base}/mock/state  ·  POST ${base}/mock/{reset,target,agent,record}`)
   console.log(`[mock-registry]   self agent   : ${SELF_ID} ("${SELF_NAME}") — unverified until its first proof lands`)
   console.log('[mock-registry] E2E submit (from por-risc0/):')

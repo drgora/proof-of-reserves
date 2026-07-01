@@ -78,8 +78,16 @@ KURIER_API_KEY=mock KURIER_API_URL=http://127.0.0.1:8091 \
 
 To make a *fresh* proof first, run the prover (`host`) per the top-level README,
 then submit as above. `npm run server:mock` is `npm run server` with
-`REGISTRY_MCP_URL`, `POR_PROOF_TYPES=proof-of-reserves,risc0`, and short cache TTLs
-prepended.
+`REGISTRY_MCP_URL`, `PIPELINE_URL=…/mock/pipeline`, `POR_PROOF_TYPES=proof-of-reserves,risc0`,
+and short cache TTLs prepended.
+
+While a proof is in flight, the Directory shows a **Verification pipeline** panel
+that polls `/api/pipeline` every ~3 s and animates each submission through
+`SUBMITTED → FINALIZED → AGGREGATED → RELAYING → RECORDING → VERIFIED` — the on-chain
+recording steps the `hl-registry-integration` skill documents (`POST /mock/record`
+seeds an already-`VERIFIED` entry if you just want to see the panel). The panel is
+hidden entirely in production unless `PIPELINE_URL` is wired to a submitter's status
+API, keeping the directory read-only by default.
 
 > Requires a `por_verify` built from this branch — it now streams the (~0.5 MB)
 > receipt to `curl` over stdin instead of an inline argv (which overflowed
@@ -93,7 +101,8 @@ prepended.
 | `POST /mock/reset` | restore the seed fixtures (clears recorded validations). |
 | `POST /mock/target` `{agentId}` | set which agent Kurier submissions attribute to. |
 | `POST /mock/agent` `{agentId?,name,proofType,…,makeTarget?}` | register/upsert an agent. |
-| `POST /mock/record` `{agentId?,proofType?,ethBlockHash?}` | inject a validation **without** running the prover (fast UI iteration). |
+| `POST /mock/record` `{agentId?,proofType?,ethBlockHash?}` | inject a validation **without** running the prover (fast UI iteration); also seeds a matching, already-`VERIFIED` entry in the pipeline. |
+| `GET /mock/pipeline` | live submission-pipeline snapshot (what `PIPELINE_URL` points the proxy at). |
 
 ### Read-side modes you can also exercise
 
@@ -123,7 +132,11 @@ proof type + PoR agents exist on the marketplace it runs in **preview mode**
 | `POR_AGENT_IDS` | _(unset)_ | Comma list of agent ids — **the production path**: directory = exactly these agents, no scan. Set this once you've registered your PoR agents. |
 | `POR_PROOF_TYPES` | `proof-of-reserves,reserves,por,risc0` | An agent counts as PoR if any receipt uses one of these proof types (case-insensitive). Set this to the exact `proofType` string you register PoR under. |
 | `POR_SHOW_ALL` | `1` | When no PoR agent is found, fall back to listing all verified agents. Set `0` to strictly show only PoR (empty until PoR exists). |
-| `ZKVERIFY_EXPLORER` | `https://zkverify-testnet.subscan.io` | Base URL for per-receipt `…/extrinsic/{txHash}` links. |
+| `ZKVERIFY_EXPLORER` | `https://zkverify-testnet.subscan.io` | Base URL for per-receipt `…/extrinsic/{txHash}` (zkVerify) links. |
+| `BASESCAN_URL` | `https://sepolia.basescan.org` | Base Sepolia explorer — on-chain `recordValidation` tx + contract/owner address links. |
+| `MARKETPLACE_URL` | `https://agent-registry.horizenlabs.io` | Marketplace base for the canonical per-agent page (`…/agent/{tokenIdHex}`). |
+| `POR_NETWORK` | `Base Sepolia` | Display label for the network the marketplace runs on (shown in the UI network badge/footer). |
+| `PIPELINE_URL` | _(unset)_ | If set, `/api/pipeline` proxies this submitter status source so the UI can show a live submission timeline. Unset → pipeline disabled. Locally point it at the mock's `/mock/pipeline`. |
 | `CACHE_TTL_MS` / `DIRECTORY_TTL_MS` | `60000` / `300000` | Cache TTLs for cheap endpoints / the verified-agent scan. |
 
 Once you register PoR on the marketplace, the simplest wiring is:
@@ -142,5 +155,6 @@ skips the (expensive) per-agent scan entirely and serves preview mode.
 | `GET /api/health` | proxy config (registry url, PoR filter settings). |
 | `GET /api/overview` | registry totals + `porTypeLive`. |
 | `GET /api/proof-types` | proof types accepted by the validation gateway. |
-| `GET /api/agents` | `{ mode, agents[], totalVerified, porCount }` — `mode` is `allowlist`/`por`/`fallback-all`. |
-| `GET /api/agents/:agentId` | full agent profile: identity, what-it-proves, receipts (with zkVerify tx/block), SLA, reputation. |
+| `GET /api/agents` | `{ mode, agents[], totalVerified, porCount, network, marketplace, baseExplorer }` — `mode` is `allowlist`/`por`/`fallback-all`. |
+| `GET /api/agents/:agentId` | full agent profile: identity, what-it-proves, receipts (with zkVerify extrinsic + on-chain `recordValidation` tx), SLA, reputation, network + explorer/marketplace bases. |
+| `GET /api/pipeline` | `{ enabled, jobs[] }` — live submission timeline (SUBMITTED→FINALIZED→AGGREGATED→RELAYING→RECORDING→VERIFIED). `enabled:false` unless `PIPELINE_URL` is set. |

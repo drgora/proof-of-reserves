@@ -21,6 +21,9 @@ export type Directory = {
   totalVerified: number
   porCount: number
   explorer: string
+  baseExplorer?: string
+  marketplace?: string
+  network?: string
 }
 
 export type ProofType = {
@@ -39,6 +42,8 @@ export type Overview = {
   porProofTypes: string[]
   porTypeLive: boolean
   explorer: string
+  baseExplorer?: string
+  marketplace?: string
 }
 
 export type Receipt = {
@@ -53,6 +58,11 @@ export type Receipt = {
     curve?: string
     constraintCount?: number
   }
+  // The on-chain ValidationGateway.recordValidation tx on Base Sepolia (present
+  // once the validation is recorded on-chain). Optional: the live registry may
+  // not surface it.
+  validationTxHash?: string
+  validationId?: number
 }
 
 export type AgentDetail = {
@@ -92,6 +102,44 @@ export type AgentDetail = {
   stats?: { slaPct: number | null; slaLast7d?: { bpsSum: number; total: number } } | null
   isPor: boolean
   explorer: string
+  baseExplorer?: string
+  marketplace?: string
+}
+
+// ---- Live submission pipeline (skill: "Persisting Pipeline State for UI Polling")
+// The stages a proof passes through, submit → on-chain validation. This mirrors
+// the status timeline the marketplace-integration skill recommends persisting.
+export type PipelineStage =
+  | 'SUBMITTED'
+  | 'FINALIZED'
+  | 'AGGREGATED'
+  | 'RELAYING'
+  | 'RECORDING'
+  | 'VERIFIED'
+  | 'FAILED'
+
+export type PipelineJob = {
+  jobId: string
+  agentId: string
+  agentName?: string
+  stage: PipelineStage
+  submittedAt: string
+  updatedAt?: string
+  zkVerifyJobId?: string
+  zkVerifyExtrinsicHash?: string
+  zkVerifyBlockHash?: string
+  aggregationId?: number
+  validationTxHash?: string
+  validationId?: number
+  ethBlockHash?: string | null
+  error?: string | null
+}
+
+export type Pipeline = {
+  enabled: boolean
+  jobs: PipelineJob[]
+  explorer?: string
+  baseExplorer?: string
 }
 
 async function get<T>(url: string): Promise<T> {
@@ -107,6 +155,7 @@ export const api = {
   overview: () => get<Overview>('/api/overview'),
   agents: () => get<Directory>('/api/agents'),
   agent: (id: string) => get<AgentDetail>(`/api/agents/${encodeURIComponent(id)}`),
+  pipeline: () => get<Pipeline>('/api/pipeline'),
 }
 
 // ---------------- formatting helpers ----------------

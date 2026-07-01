@@ -2,7 +2,8 @@ import type { ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useAgent } from '../hooks'
 import { fmtNum, fmtPct, fmtTime, shortHash, txUrl, type Receipt } from '../api'
-import { ErrorBox, Loading, PorBadge, SlaMeter, TypeBadge, VerifiedBadge } from '../components'
+import { baseAddressUrl, baseTxUrl, marketplaceAgentUrl } from '../chain'
+import { ErrorBox, Loading, NetworkBadge, PorBadge, SlaMeter, TypeBadge, VerifiedBadge } from '../components'
 
 export default function AgentDetail() {
   const { agentId } = useParams()
@@ -27,9 +28,20 @@ export default function AgentDetail() {
         <h1>{a.name || 'Unnamed agent'}</h1>
         {d.isPor ? <PorBadge /> : a.zkVerified ? <VerifiedBadge /> : null}
         <TypeBadge type={a.type} />
+        <NetworkBadge network={d.network} />
         {!a.active && <span className="badge type">inactive</span>}
       </div>
-      <span className="detail-id mono">{a.agentId}</span>
+      <div className="detail-sub">
+        <span className="detail-id mono">{a.agentId}</span>
+        <a
+          className="marketplace-link"
+          href={marketplaceAgentUrl(d.marketplace, a.agentId)}
+          target="_blank"
+          rel="noreferrer"
+        >
+          View on marketplace ↗
+        </a>
+      </div>
       {a.description && <p className="detail-desc">{a.description}</p>}
 
       <div className="bigmetrics">
@@ -52,7 +64,23 @@ export default function AgentDetail() {
         <div className="panel">
           <h3>Identity</h3>
           <KV k="Agent ID" v={<span className="mono">{a.agentId}</span>} />
-          <KV k="Owner" v={<span className="mono">{shortHash(a.owner, 10, 8)}</span>} />
+          <KV
+            k="Owner"
+            v={
+              /^0x[0-9a-fA-F]{40}$/.test(a.owner) ? (
+                <a
+                  className="mono"
+                  href={baseAddressUrl(d.baseExplorer, a.owner)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {shortHash(a.owner, 10, 8)} ↗
+                </a>
+              ) : (
+                <span className="mono">{shortHash(a.owner, 10, 8)}</span>
+              )
+            }
+          />
           {a.type && <KV k="Type" v={a.type} />}
           {a.pricing && <KV k="Pricing" v={a.pricing} />}
           <KV k="Active" v={a.active ? 'Yes' : 'No'} />
@@ -98,14 +126,22 @@ export default function AgentDetail() {
 
         <div className="panel full">
           <h3>Quality receipts {r.returned < r.count ? `(latest ${r.returned} of ${r.count})` : `(${r.count})`}</h3>
-          <ReceiptsTable items={r.items} explorer={d.explorer} />
+          <ReceiptsTable items={r.items} explorer={d.explorer} baseExplorer={d.baseExplorer} />
         </div>
       </div>
     </>
   )
 }
 
-function ReceiptsTable({ items, explorer }: { items: Receipt[]; explorer: string }) {
+function ReceiptsTable({
+  items,
+  explorer,
+  baseExplorer,
+}: {
+  items: Receipt[]
+  explorer: string
+  baseExplorer?: string
+}) {
   if (!items?.length) return <div style={{ color: 'var(--muted)' }}>No receipts.</div>
   return (
     <div className="table-wrap">
@@ -117,7 +153,7 @@ function ReceiptsTable({ items, explorer }: { items: Receipt[]; explorer: string
             <th>Proof type</th>
             <th>When</th>
             <th>zkVerify tx</th>
-            <th>Block</th>
+            <th>On-chain validation</th>
           </tr>
         </thead>
         <tbody>
@@ -140,7 +176,15 @@ function ReceiptsTable({ items, explorer }: { items: Receipt[]; explorer: string
                   '—'
                 )}
               </td>
-              <td className="mono">{shortHash(it.zkVerify?.blockHash)}</td>
+              <td className="mono">
+                {it.validationTxHash ? (
+                  <a href={baseTxUrl(baseExplorer, it.validationTxHash)} target="_blank" rel="noreferrer">
+                    {shortHash(it.validationTxHash)} ↗
+                  </a>
+                ) : (
+                  '—'
+                )}
+              </td>
             </tr>
           ))}
         </tbody>

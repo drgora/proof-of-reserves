@@ -7,7 +7,7 @@
     "dev": "vite",
     "server": "node server.mjs",
     "mock": "node mock-registry.mjs",
-    "server:mock": "REGISTRY_MCP_URL=http://127.0.0.1:8091/api/mcp POR_PROOF_TYPES=proof-of-reserves,risc0 CACHE_TTL_MS=3000 DIRECTORY_TTL_MS=3000 node server.mjs",
+    "server:mock": "REGISTRY_MCP_URL=http://127.0.0.1:8091/api/mcp PIPELINE_URL=http://127.0.0.1:8091/mock/pipeline POR_PROOF_TYPES=proof-of-reserves,risc0 CACHE_TTL_MS=3000 DIRECTORY_TTL_MS=3000 node server.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },

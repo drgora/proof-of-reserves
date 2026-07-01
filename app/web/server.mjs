@@ -22,6 +22,13 @@
 //                        PoR is registered). Set "0" to strictly show only PoR.
 //   CACHE_TTL_MS         default 60000
 //   ZKVERIFY_EXPLORER    default https://zkverify-testnet.subscan.io  (per-tx link base)
+//   BASESCAN_URL         default https://sepolia.basescan.org  (Base Sepolia explorer:
+//                        recordValidation tx + contract/owner address links)
+//   MARKETPLACE_URL      default https://agent-registry.horizenlabs.io  (canonical
+//                        per-agent marketplace page base)
+//   PIPELINE_URL         (unset) — if set, /api/pipeline proxies this submitter
+//                        status source (e.g. the mock's /mock/pipeline, or a real
+//                        submitter's status API). Unset → pipeline disabled.
 
 import http from 'node:http'
 
@@ -42,6 +49,10 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000)
 // than the cheap single-shot endpoints.
 const DIRECTORY_TTL_MS = Number(process.env.DIRECTORY_TTL_MS || 300_000)
 const ZKVERIFY_EXPLORER = process.env.ZKVERIFY_EXPLORER || 'https://zkverify-testnet.subscan.io'
+const BASESCAN_URL = process.env.BASESCAN_URL || 'https://sepolia.basescan.org'
+const MARKETPLACE_URL = process.env.MARKETPLACE_URL || 'https://agent-registry.horizenlabs.io'
+const NETWORK = process.env.POR_NETWORK || 'Base Sepolia'
+const PIPELINE_URL = process.env.PIPELINE_URL || ''
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -207,7 +218,14 @@ async function getOverview() {
     const { structured } = await mcpTool('get_registry_overview')
     const proofTypes = structured?.proofTypes?.types || []
     const porTypeLive = proofTypes.some((t) => POR_PROOF_TYPES.includes(norm(t.proofType)))
-    return { ...structured, porProofTypes: POR_PROOF_TYPES, porTypeLive, explorer: ZKVERIFY_EXPLORER }
+    return {
+      ...structured,
+      porProofTypes: POR_PROOF_TYPES,
+      porTypeLive,
+      explorer: ZKVERIFY_EXPLORER,
+      baseExplorer: BASESCAN_URL,
+      marketplace: MARKETPLACE_URL,
+    }
   })
 }
 
@@ -263,6 +281,27 @@ function porTypesOf(detail) {
   return [...new Set([...(w?.proofTypes || []), ...(detail?.receipts?.items || []).map((r) => r.proofType)])].filter(Boolean)
 }
 
+/**
+ * Live submission pipeline. Pipeline state (Kurier → zkVerify → attestation relay
+ * → on-chain recordValidation) is owned by the *submitter*, not the read-only
+ * registry — so it comes from a separate PIPELINE_URL status source (the mock's
+ * /mock/pipeline locally; a real submitter's status API in prod). Unset → disabled.
+ */
+async function getPipeline() {
+  if (!PIPELINE_URL) return { enabled: false, jobs: [] }
+  return cached('pipeline', 2000, async () => {
+    try {
+      const res = await fetch(PIPELINE_URL, { headers: { accept: 'application/json' } })
+      if (!res.ok) return { enabled: true, jobs: [], error: `pipeline HTTP ${res.status}` }
+      const data = await res.json()
+      const jobs = Array.isArray(data) ? data : data.jobs || []
+      return { enabled: true, jobs, explorer: ZKVERIFY_EXPLORER, baseExplorer: BASESCAN_URL }
+    } catch (e) {
+      return { enabled: true, jobs: [], error: e.message }
+    }
+  })
+}
+
 function detailToRow(detail) {
   const a = detail.agent || {}
   const r = detail.receipts || {}
@@ -298,6 +337,10 @@ const routes = [
     handler: async () => ({
       ok: true,
       registry: REGISTRY_MCP_URL,
+      network: NETWORK,
+      baseExplorer: BASESCAN_URL,
+      marketplace: MARKETPLACE_URL,
+      pipeline: PIPELINE_URL ? PIPELINE_URL : false,
       porProofTypes: POR_PROOF_TYPES,
       porAgentIds: POR_AGENT_IDS,
       showAllFallback: POR_SHOW_ALL,
@@ -318,8 +361,19 @@ const routes = [
     pattern: /^\/api\/agents$/,
     handler: async () => {
       const dir = await getDirectory()
-      return { ...dir, explorer: ZKVERIFY_EXPLORER }
+      return {
+        ...dir,
+        network: NETWORK,
+        explorer: ZKVERIFY_EXPLORER,
+        baseExplorer: BASESCAN_URL,
+        marketplace: MARKETPLACE_URL,
+      }
     },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/api\/pipeline$/,
+    handler: () => getPipeline(),
   },
   {
     method: 'GET',
@@ -336,7 +390,15 @@ const routes = [
       } catch {
         /* stats are best-effort */
       }
-      return { ...detail, stats, isPor: isPorAgent(detail), explorer: ZKVERIFY_EXPLORER }
+      return {
+        ...detail,
+        stats,
+        isPor: isPorAgent(detail),
+        network: NETWORK,
+        explorer: ZKVERIFY_EXPLORER,
+        baseExplorer: BASESCAN_URL,
+        marketplace: MARKETPLACE_URL,
+      }
     },
   },
 ]
