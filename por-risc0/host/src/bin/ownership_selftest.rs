@@ -48,14 +48,20 @@ fn single_leaf_trie(address: &[u8; 20], account_rlp: &[u8]) -> (B256, Vec<Vec<u8
     (keccak256(&node), vec![node])
 }
 
-// Minimal header: RLP list [parent(32), ommers(32), beneficiary(20), state_root(32)].
-// The guest reads only item index 3 (state_root) and keccaks the whole thing.
-fn header_rlp(state_root: &B256) -> Vec<u8> {
+// Minimal header: RLP list of items 0..=8. The guest reads item 3 (state_root) and item 8
+// (block number) and keccaks the whole thing; items 4..7 are filler valid RLP so the walk
+// reaches item 8.
+fn header_rlp(state_root: &B256, number: u64) -> Vec<u8> {
     let mut payload = Vec::new();
-    B256::ZERO.encode(&mut payload);
-    B256::ZERO.encode(&mut payload);
-    Address::ZERO.encode(&mut payload);
-    state_root.encode(&mut payload);
+    B256::ZERO.encode(&mut payload); // 0 parent_hash
+    B256::ZERO.encode(&mut payload); // 1 ommers_hash
+    Address::ZERO.encode(&mut payload); // 2 beneficiary
+    state_root.encode(&mut payload); // 3 state_root
+    B256::ZERO.encode(&mut payload); // 4 transactions_root
+    B256::ZERO.encode(&mut payload); // 5 receipts_root
+    [0u8; 256].as_slice().encode(&mut payload); // 6 logs_bloom
+    0u64.encode(&mut payload); // 7 difficulty (0 post-merge)
+    number.encode(&mut payload); // 8 number
     let mut out = Vec::new();
     RlpHeader { list: true, payload_length: payload.len() }.encode(&mut out);
     out.extend_from_slice(&payload);
@@ -69,7 +75,16 @@ fn eip191_prehash(block_hash: &[u8; 32]) -> [u8; 32] {
     keccak256(&msg).into()
 }
 
-fn make_env(w: &Witness, sig: &[u8], threshold: u128, chain_id: u32, debug: bool) -> ExecutorEnv<'static> {
+#[allow(clippy::too_many_arguments)]
+fn make_env(
+    w: &Witness,
+    sig: &[u8],
+    threshold: u128,
+    chain_id: u32,
+    debug: bool,
+    challenge_nonce: &[u8; 32],
+    agent_id: &[u8; 32],
+) -> ExecutorEnv<'static> {
     ExecutorEnv::builder()
         .write(&w.header_rlp).unwrap()
         .write(&w.account_proof).unwrap()
@@ -82,6 +97,8 @@ fn make_env(w: &Witness, sig: &[u8], threshold: u128, chain_id: u32, debug: bool
         .write(&threshold).unwrap()
         .write(&chain_id).unwrap()
         .write(&debug).unwrap()
+        .write(challenge_nonce).unwrap()
+        .write(agent_id).unwrap()
         .build()
         .unwrap()
 }
@@ -110,7 +127,8 @@ fn main() {
     let account_rlp = alloy_rlp::encode(&account);
 
     let (state_root, account_proof) = single_leaf_trie(&address, &account_rlp);
-    let header = header_rlp(&state_root);
+    let block_number = 20_345_678u64;
+    let header = header_rlp(&state_root, block_number);
     let block_hash: [u8; 32] = keccak256(&header).into();
 
     // Sign EIP-191(block_hash) -> r||s||recid (65 bytes), the guest's expected encoding.
@@ -131,6 +149,9 @@ fn main() {
     };
     let chain_id = 1u32;
     let threshold = 1_000_000_000_000_000_000u128; // 1 ETH (<= balance)
+    // challenge labels echoed through the journal (P2 asserts they round-trip).
+    let challenge_nonce: [u8; 32] = [0xAB; 32];
+    let agent_id: [u8; 32] = keccak256(b"0xagent-selftest").into();
 
     println!("address 0x{} (key we hold), balance {} ETH", hex::encode(address), balance as f64 / 1e18);
     let exec = default_executor();
@@ -138,25 +159,33 @@ fn main() {
     // [1] POSITIVE: ownership ON, balance >= threshold.
     println!("[1] positive: debug=false, valid sig, balance>=threshold ...");
     let session = exec
-        .execute(make_env(&w, &sig65, threshold, chain_id, false), POR_GUEST_ELF)
+        .execute(make_env(&w, &sig65, threshold, chain_id, false, &challenge_nonce, &agent_id), POR_GUEST_ELF)
         .expect("positive ownership execution failed");
-    let (jbh, jth, jcid, jdbg): ([u8; 32], u128, u32, bool) =
-        session.journal.decode().expect("journal decode");
+    let (jbh, jth, jcid, jdbg, jnonce, jagent, jnum): (
+        [u8; 32], u128, u32, bool, [u8; 32], [u8; 32], u64,
+    ) = session.journal.decode().expect("journal decode");
     assert_eq!(jbh, w.block_hash, "journal block_hash mismatch");
     assert_eq!(jth, threshold);
     assert_eq!(jcid, chain_id);
     assert!(!jdbg, "debug should be false");
+    assert_eq!(jnonce, challenge_nonce, "challenge_nonce did not echo into journal");
+    assert_eq!(jagent, agent_id, "agent_id did not echo into journal");
+    assert_eq!(jnum, block_number, "journal block_number != header item 8");
     // privacy: address + balance must NOT be in the journal
     let jbytes = session.journal.bytes.clone();
     assert!(!jbytes.windows(20).any(|w2| w2 == address), "address leaked into journal");
-    println!("    OK: in-guest ownership verified; journal {{block_hash, threshold, chain_id, debug=false}}, addr+balance hidden");
+    // risc0 serde word-expands every field (each byte of a [u8;32] -> a 4-byte LE word,
+    // u64 -> 2 words), so the journal is 416 bytes, not a 125-byte packed layout.
+    // 128(block_hash)+16(threshold)+4(chain_id)+4(debug)+128(nonce)+128(agent_id)+8(number).
+    assert_eq!(jbytes.len(), 416, "journal layout changed (risc0-serde word-expanded size)");
+    println!("    OK: in-guest ownership verified; journal {{block_hash, threshold, chain_id, debug=false, challenge_nonce, agent_id, block_number={jnum}}}, addr+balance hidden");
 
     // [2] NEGATIVE: tampered signature.
     println!("[2] negative: tampered signature ...");
     let mut bad = sig65.clone();
     bad[5] ^= 0xff;
     assert!(
-        exec.execute(make_env(&w, &bad, threshold, chain_id, false), POR_GUEST_ELF).is_err(),
+        exec.execute(make_env(&w, &bad, threshold, chain_id, false, &challenge_nonce, &agent_id), POR_GUEST_ELF).is_err(),
         "tampered signature was NOT rejected"
     );
     println!("    OK: rejected");
@@ -168,7 +197,7 @@ fn main() {
     let mut sigw = sig2.to_bytes().to_vec();
     sigw.push(rid2.to_byte());
     assert!(
-        exec.execute(make_env(&w, &sigw, threshold, chain_id, false), POR_GUEST_ELF).is_err(),
+        exec.execute(make_env(&w, &sigw, threshold, chain_id, false, &challenge_nonce, &agent_id), POR_GUEST_ELF).is_err(),
         "wrong-signer signature was NOT rejected"
     );
     println!("    OK: rejected (signer address != proven address)");
@@ -176,7 +205,7 @@ fn main() {
     // [4] NEGATIVE: balance below threshold.
     println!("[4] negative: balance < threshold ...");
     assert!(
-        exec.execute(make_env(&w, &sig65, balance + 1, chain_id, false), POR_GUEST_ELF).is_err(),
+        exec.execute(make_env(&w, &sig65, balance + 1, chain_id, false, &challenge_nonce, &agent_id), POR_GUEST_ELF).is_err(),
         "below-threshold was NOT rejected"
     );
     println!("    OK: rejected");
@@ -186,7 +215,7 @@ fn main() {
         println!("[5] proving real succinct receipt (debug=false) ...");
         let t = Instant::now();
         let receipt = default_prover()
-            .prove_with_opts(make_env(&w, &sig65, threshold, chain_id, false), POR_GUEST_ELF, &ProverOpts::succinct())
+            .prove_with_opts(make_env(&w, &sig65, threshold, chain_id, false, &challenge_nonce, &agent_id), POR_GUEST_ELF, &ProverOpts::succinct())
             .unwrap()
             .receipt;
         receipt.verify(POR_GUEST_ID).unwrap();

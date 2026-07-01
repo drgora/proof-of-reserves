@@ -17,16 +17,19 @@ Authenticity is anchored on `block_hash`: the verifier binds `keccak256(attested
 **tlsn is a pinned *git dependency*, not vendored** — `github.com/tlsnotary/tlsn` rev `0fe3c32d35382b3f290a43c4156399ca4512bb89` (the alpha `Session`/driver API).
 
 - **`por-risc0/`** — **the active flow** (Risc0 zkVM; cargo-risczero layout, its own target).
-  - `host/src/main.rs` (bin `host`) — prover. Fetches `eth_getProof` + `debug_getRawHeader` from drpc (`curl`), builds the witness, proves a **succinct** receipt, writes `proof.json` (the zkVerify/Kurier bundle: `proofType risc0` / `V3_0` / CBOR receipt / image_id / journal). Two modes:
+  - `host/src/main.rs` (bin **`prover`**) — the agent-side tool. Runs three ways: **connected** (`--verifier <url> --agent-id <id> --threshold <wei>` → requests the challenge, proves, submits, prints the verdict — the whole agent flow in one command); **file** (`--challenge <file>` / `POR_CHALLENGE` → writes `response.json`); **legacy** (no challenge → single-block `proof.json`). For each of the **3 challenged blocks** it fetches `eth_getProof` + `debug_getRawHeader` from drpc, proves a **succinct** receipt, and signs the challenge with the agent's owner EOA; the response is `{version, challenge, owner_sig, bundles[3]}` (each bundle is the zkVerify/Kurier shape: `proofType risc0` / `V3_0` / CBOR receipt / image_id / journal, + optional `tlsnPresentation`). Per-block modes:
     - **DEMO** (no key): proves the beacon deposit contract with `debug=true` (no private key for a contract).
-    - **OWNERSHIP** (`POR_PRIVATE_KEY=<32B hex>`): derive the EOA, fetch *its* proof, sign EIP-191(`block_hash`), prove `debug=false`.
-    - **TLSNotary**: if `NOTARY_ADDR` is set, MPC-TLS-attests `debug_getRawHeader(N)` to drpc via the notary and bundles the `Presentation` into `proof.json` (`src/attest.rs`, a noir-free port of por-zk's `por_core`); unset → dev mode (no presentation).
-    - Env: `POR_THRESHOLD` (wei, default 1 ETH), `POR_SEGMENT_PO2` (segment size; default 20), `NOTARY_ADDR` (notary TCP addr → enables attestation).
+    - **OWNERSHIP** (`POR_PRIVATE_KEY=<32B hex>`): derive the EOA, fetch *its* proof, sign EIP-191(`block_hash`) in-circuit, `debug=false`.
+    - **TLSNotary**: if `NOTARY_ADDR` is set, MPC-TLS-attests each block's `debug_getRawHeader(N)` and bundles the `Presentation` (`host::attest`, from `src/attest.rs`); unset → dev mode (no presentation).
+    - Env: `POR_THRESHOLD` (legacy-mode wei, default 1 ETH; challenge mode uses the challenge's T), `POR_SEGMENT_PO2` (default 20), `NOTARY_ADDR` (→ per-block attestation), `POR_OWNER_KEY` (owner EOA for the challenge signature; falls back to `POR_PRIVATE_KEY`).
+  - `host/src/bin/verifier.rs` (bin **`verifier`**) — the **remote verifier service** (hyper). `POST /v1/challenges {agent_id, threshold}` → looks up the agent's `owner` in the registry, draws a random nonce, pins the finalized head H, derives **3 recent block numbers** `f(nonce,H,W)` spread one-per-third across the window, records a session, returns the challenge. `POST /v1/challenges/{id}/response` → verifies all 3 receipts + TLSNotary bindings (reuses `host::verify`), cross-checks they answer *this* challenge (same `challenge_nonce`/`agent_id`, proven block-number set == challenged set, each attested header's number == its journal `block_number`), authenticates `ecrecover(owner_sig) == registry owner`, returns a verdict; on `verified`, background-settles all 3 on Kurier. `GET /v1/challenges/{id}` → state + verdict + settle status. Env: `VERIFIER_ADDR` (default `127.0.0.1:7100`), `POR_REGISTRY_URL` (default `http://127.0.0.1:8090`), `POR_WINDOW_DAYS` (3), `POR_SLOT_SECONDS` (12), `POR_ALLOW_DEBUG`, `POR_ALLOW_UNVERIFIED_OWNER` (dev: skip owner auth — tolerates a placeholder / unknown / **unreachable** registry, so no registry is needed locally), `POR_ALLOW_NO_PRESENTATION` (dev: accept bundles without a presentation), `KURIER_API_KEY` (enables settle).
   - `host/src/bin/notary.rs` (bin `notary`) — the **TLSNotary notary** (own secp256k1 key persisted to `notary-signing-key.bin`; a separate trust domain). Co-runs the MPC-TLS session and signs the attestation. Port of por-zk's `zerion_notary`, reusing por-risc0's compiled tlsn.
-  - `host/src/bin/por_verify.rs` — independent verifier (unified). Verifies the receipt against the guest ID, decodes the journal, and **binds** `keccak256(attested header) == journal.block_hash`, where the attested header comes from the bundled TLSNotary `Presentation` (verified: notary sig + Mozilla cert chain + drpc Host allowlist; the header is recovered from the revealed response) — or a dev-only by-hash re-fetch if no presentation. Then enforces policy (reject `debug != 0` unless `POR_ALLOW_DEBUG`, `threshold ≥ POR_REQUIRED_THRESHOLD`, `chain_id == 1`). Finally, if `KURIER_API_KEY` is set, it submits the verified receipt to **zkVerify via Kurier** (`POST /submit-proof` → poll `/job-status` to inclusion) — the relying party settles on-chain only what it already verified. Env: `KURIER_API_KEY` (gates it), `KURIER_API_URL` (default `https://api-testnet.kurier.xyz`), `KURIER_CHAIN_ID` (optional).
-  - `host/src/bin/ownership_selftest.rs` — synthetic-state self-test of the `debug=false` ownership path (positive + negative controls; `POR_SELFTEST_PROVE=1` also produces a real receipt).
-  - `methods/guest/src/main.rs` — the guest: `extract_state_root` (alloy-rlp header walk to item 3) → `verify_proof` (alloy-trie `TrieAccount` MPT) → ownership (`k256` ecrecover, unless `debug`) → `balance ≥ threshold` → commit `{block_hash, threshold, chain_id, debug}`. **Accelerated precompiles**: k256 + keccak via the risc0 forks (see gotchas).
+  - `host/src/bin/por_verify.rs` — **offline verifier CLI** (a thin wrapper over `host::verify`, for a single `proof.json`). Verifies the receipt against the guest ID, decodes the journal, and **binds** `keccak256(attested header) == journal.block_hash` from the bundled TLSNotary `Presentation` (notary sig + Mozilla cert chain + drpc Host allowlist; header recovered from the revealed response) — or a dev-only by-hash re-fetch. Then enforces policy (reject `debug != 0` unless `POR_ALLOW_DEBUG`, `threshold ≥ POR_REQUIRED_THRESHOLD`, `chain_id == 1`) and, if `KURIER_API_KEY` is set, settles on **zkVerify via Kurier**. The `verifier` service reuses the same `host::verify` functions. Env: `KURIER_API_KEY`, `KURIER_API_URL` (default `https://api-testnet.kurier.xyz`), `KURIER_CHAIN_ID`.
+  - `host/src/lib.rs` + `host/src/verify.rs` — the shared library: `attest` (TLSNotary MPC-TLS header attestation) + `verify` (receipt/journal decode → 7-field `Journal`, presentation binding, `header_block_number`, `recover_address_from_prehash` for owner-sig auth, policy, Kurier). Used by BOTH `por_verify` and `verifier` so they can't drift.
+  - `host/src/bin/ownership_selftest.rs` — synthetic-state self-test of the `debug=false` ownership path (positive + negative controls; also asserts the new journal fields `challenge_nonce`/`agent_id`/`block_number` echo/derive correctly; `POR_SELFTEST_PROVE=1` adds a real receipt).
+  - `methods/guest/src/main.rs` — the guest: `extract_header_fields` (alloy-rlp header walk → item 3 `state_root` + item 8 `block_number`) → `verify_proof` (alloy-trie `TrieAccount` MPT) → ownership (`k256` ecrecover, unless `debug`) → `balance ≥ threshold` → commit `{block_hash, threshold, chain_id, debug, challenge_nonce, agent_id, block_number}` (balance + address stay private; `block_number` derived in-circuit so it's unspoofable). **Accelerated precompiles**: k256 + keccak via the risc0 forks (see gotchas).
   - `cudacheck.c` / `cudacheck_dl.c` — CUDA bring-up probes. `[features] cuda` enables GPU proving (see GPU gotcha).
+- **`por-risc0/por-types/`** — tiny pure-serde crate (no risc0/tlsn): `Challenge`/`Response` wire types + `canonical_bytes()`/`challenge_digest()`/`agent_id_hash()`. The **single source of truth** for the owner-signature contract, imported by both `prover` and `verifier` so the signed-challenge serialization can't drift.
 - **`por-zk/`** — **trimmed TLSNotary reference** (source-only, ~200 K; builds without Barretenberg now).
   - Built bins: `zerion_notary` (the separate notary — own secp256k1 key; adds signed `por.recv_commitments` + `por.siwe` attestation extensions) and `siwe_selftest`.
   - Reference source only (no `[[bin]]`, not built): `por_core.rs` (MPC-TLS prover), `por_witness.rs`, `por_zk.rs`, `por_prove.rs`, `por_verifier.rs`, `por_service.rs`, `siwe_verify.rs`, `types.rs`. This is the reference for wiring TLSNotary attestation into the Risc0 flow. *(The Noir/UltraHonk circuit + the noir-rs/Barretenberg dep were removed when the ZK layer moved to Risc0.)*
@@ -36,31 +39,42 @@ Authenticity is anchored on `block_hash`: the verifier binds `keccak256(attested
 
 Toolchain: **rustc ≥ 1.95** (the tlsn alpha, for `por-zk`) + the **Risc0 toolchain** for the guest (`rzup`: cargo-risczero / r0vm **3.0.4** = zkVerify `V3_0`; `rzup install rust` if the guest toolchain is too old for alloy's deps). Node 22.
 
-- **`por-risc0/` (active):** `cd por-risc0 && cargo build --release` (builds `host`, `por_verify`, `ownership_selftest`; the guest ELF builds via `risc0-build`). GPU: `--features cuda` (see GPU gotcha — CUDA 12.x + ≥16 GB VRAM).
+- **`por-risc0/` (active):** `cd por-risc0 && cargo build --release` (builds `prover`, `verifier`, `por_verify`, `notary`, `ownership_selftest` + the `por-types` crate; the guest ELF builds via `risc0-build`). GPU: `--features cuda` (see GPU gotcha — CUDA 12.x + ≥16 GB VRAM).
 - **`por-zk/` (reference):** `cargo build --manifest-path por-zk/Cargo.toml` — builds `zerion_notary` + `siwe_selftest` (the tlsn/MPC-TLS stack is the bulk; no Barretenberg).
 - **Frontend (verified-agent directory):** `npm --prefix app/web install`, then run **two** processes: `npm --prefix app/web run server` (the read-proxy on :8090) and `npm --prefix app/web run dev` (Vite :5173, proxies `/api` → :8090). `run build` for a static bundle. PoR filter via env on the proxy (`POR_AGENT_IDS` / `POR_PROOF_TYPES`); see `app/web/README.md`.
 - **Bumping the tlsn rev** means re-checking the API against the alpha — it changes shape between revs.
 
 ## Run
 
-**The product (Risc0 + TLSNotary, balance + address hidden):**
+**The product (interactive challenge/response; Risc0 + TLSNotary; balance + address hidden):**
 ```bash
 # 1. Notary (separate trust domain) on :7150
 NOTARY_ADDR=127.0.0.1:7150 por-risc0/target/release/notary &
-# 2. Prove + MPC-TLS-attest (DEMO: beacon contract, debug=true) -> proof.json (+ presentation)
-NOTARY_ADDR=127.0.0.1:7150 por-risc0/target/release/host
-#    OWNERSHIP variant: a funded EOA you hold the key for, debug=false
-POR_PRIVATE_KEY=<32B-hex> POR_THRESHOLD=<wei> NOTARY_ADDR=127.0.0.1:7150 por-risc0/target/release/host
-# 3. Verify receipt + TLSNotary presentation + binding (debug=true receipt needs POR_ALLOW_DEBUG=1)
-POR_REQUIRED_THRESHOLD=<wei> por-risc0/target/release/por_verify
-#    ...and settle on-chain on zkVerify — the relying party submits what it verified:
-KURIER_API_KEY=<key> POR_REQUIRED_THRESHOLD=<wei> por-risc0/target/release/por_verify
+# 2. Verifier service on :7100 (looks up the agent's owner via the registry read-proxy on :8090)
+por-risc0/target/release/verifier &
+# 3. Agent: request challenge -> prove all 3 blocks -> submit -> print verdict, in ONE command.
+#    POR_PRIVATE_KEY = funded wallet key; POR_OWNER_KEY = the agent's owner EOA (per the registry).
+POR_PRIVATE_KEY=<32B-hex> POR_OWNER_KEY=<32B-hex> NOTARY_ADDR=127.0.0.1:7150 \
+  por-risc0/target/release/prover --verifier http://127.0.0.1:7100 \
+    --agent-id <agent-id> --threshold <wei>
 ```
-Omit `NOTARY_ADDR` for a dev run (no attestation; `por_verify` falls back to a by-hash header re-fetch). `por_verify` submits to **zkVerify via Kurier** when `KURIER_API_KEY` is set — verified compatible: zkVerify's `risc0-verifier` supports risc0 **v3.0.0** (our r0vm-3.0.4 / `V3_0` receipt), and `proof.json`'s `proofData` is already the required shape (`proof` = hex CBOR receipt, `vk` = LE-word image_id, `publicSignals` = hex journal); no VK pre-registration. CPU proving is ~265 s (debug) / ~300–530 s (ownership). The first `--release` build also compiles the tlsn/MPC-TLS stack alongside risc0 (heavier, one-time).
+Or drive it manually: `POST /v1/challenges {agent_id, threshold}` → `prover --challenge challenge.json --out response.json` → `POST /v1/challenges/{id}/response` (`--data-binary @response.json`), then poll `GET /v1/challenges/{id}`. Omit `NOTARY_ADDR` for a dev run (no attestation; start the verifier with `POR_ALLOW_NO_PRESENTATION=1`). DEMO mode (no `POR_PRIVATE_KEY`) proves the beacon contract with `debug=true` (verifier needs `POR_ALLOW_DEBUG=1`). **Fast E2E**: `RISC0_DEV_MODE=1` on **both** prover and verifier (skips real proving). On-chain settle: set `KURIER_API_KEY` on the verifier — it background-settles each verified bundle to **zkVerify via Kurier** (verified compatible: zkVerify's `risc0-verifier` supports risc0 **v3.0.0** = our r0vm-3.0.4 / `V3_0`; each bundle's `proofData` is already `proof`=hex CBOR receipt, `vk`=LE-word image_id, `publicSignals`=hex journal; no VK pre-registration). CPU proving is ~265 s (debug) / ~300–530 s (ownership) **per block** → ~13–27 min for the 3-block challenge. The first `--release` build also compiles the tlsn/MPC-TLS stack (heavier, one-time).
+
+**Legacy single-block** (no challenge): `por-risc0/target/release/prover` → `proof.json`, verified offline by `POR_REQUIRED_THRESHOLD=<wei> por-risc0/target/release/por_verify`.
+
+**Local smoke test** (no key, no registry, no notary; needs only drpc network — dev-mode fake receipts):
+```bash
+cd por-risc0 && cargo build --release
+RISC0_DEV_MODE=1 POR_ALLOW_DEBUG=1 POR_ALLOW_NO_PRESENTATION=1 POR_ALLOW_UNVERIFIED_OWNER=1 \
+  POR_REGISTRY_URL=http://127.0.0.1:9 ./target/release/verifier &        # :9 = nothing there
+RISC0_DEV_MODE=1 ./target/release/prover --verifier http://127.0.0.1:7100 \
+  --agent-id anything --threshold 1000000000000000000                     # -> verdict: verified
+```
 
 ## Tests / self-checks
 
-- `por-risc0/target/release/ownership_selftest` — execution + negative controls for the `debug=false` ownership path; `POR_SELFTEST_PROVE=1` adds a real succinct prove (~5 min CPU).
+- `cargo test -p por-types` — challenge serde roundtrip, `canonical_bytes` layout freeze, threshold parsing, digest determinism/binding.
+- `por-risc0/target/release/ownership_selftest` — execution + negative controls for the `debug=false` ownership path; also asserts the 7-field journal (`challenge_nonce`/`agent_id` echo, `block_number` == header item 8, 416-byte word-expanded size). `POR_SELFTEST_PROVE=1` adds a real succinct prove (~5 min CPU).
 - `por-risc0/target/release/por_verify` — verifies a receipt + the `block_hash` binding (against a `proof.json`).
 - `por-zk/target/.../siwe_selftest` — SIWE EIP-191 recovery roundtrip.
 
@@ -68,10 +82,12 @@ Omit `NOTARY_ADDR` for a dev run (no attestation; `por_verify` falls back to a b
 
 Three independent trust domains, bound by **`block_hash`**:
 1. **Agent / prover** — holds the wallet key, fetches state from a named RPC, proves in Risc0 (balance + address private).
-2. **Notary** (TLSNotary, separate process, own key) — co-runs the RPC TLS session via MPC so session keys are **split**; signs a commitment to the *encrypted* transcript, never sees plaintext, cannot forge it. *(Reference in `por-zk`; not yet integrated into the Risc0 flow.)*
-3. **Verifier** (independent) — verifies the Risc0 receipt, binds `keccak256(attested header) == journal.block_hash`, enforces policy. In prod the header comes from the TLSNotary presentation (proving a named RPC served it); the cert identifies the *RPC*, not the chain, so chain identity rests on a Host allowlist + M-of-N RPC quorum.
+2. **Notary** (TLSNotary, separate process, own key) — co-runs the RPC TLS session via MPC so session keys are **split**; signs a commitment to the *encrypted* transcript, never sees plaintext, cannot forge it. **Wired into the Risc0 flow**: the prover MPC-TLS-attests each challenged block's header via `bin notary`; `por-zk` holds the fuller reference.
+3. **Verifier** (independent, now a **remote service**) — **issues the challenge** (random nonce → 3 recent block numbers), then verifies the 3 Risc0 receipts, binds `keccak256(attested header) == journal.block_hash` for each, cross-checks they answer *this* challenge, and **authenticates the agent** via `ecrecover(owner_sig) == registry owner`. In prod the header comes from the TLSNotary presentation (proving a named RPC served it); the cert identifies the *RPC*, not the chain, so chain identity rests on a Host allowlist + M-of-N RPC quorum.
 
 The Risc0 proof says "balance ≥ T under this `block_hash`"; the attestation says "a named RPC served the header whose keccak == `block_hash`."
+
+**Freshness / interactive challenge.** The verifier — not the prover — chooses *which* blocks to prove: it draws a random nonce and derives 3 recent block numbers spread across a multi-day window (`f(nonce, finalized-head, W)`). Because the blocks are unpredictable and already finalized, the prover can't pre-compute, replay a stale proof, cherry-pick a favorable block, or satisfy the threshold with momentarily-borrowed funds (it must have held ≥ T across all 3 points). Each journal commits `challenge_nonce` + `agent_id` (binding the proofs to this challenge and agent), and the owner signature over the whole challenge is checked against the agent's registry `owner` — so a proof can't be replayed under another challenge or attributed to another agent. Canonical serialization lives in `por-types`.
 
 ## Critical gotchas (these will bite)
 

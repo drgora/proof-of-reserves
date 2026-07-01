@@ -1,0 +1,14 @@
+[package]
+name = "por-types"
+version = "0.1.0"
+edition = "2021"
+
+# Pure serde wire types + the canonical challenge serialization shared by the prover and
+# the verifier service. NO risc0 / tlsn deps -- kept light on purpose so both sides can
+# depend on it and the owner-signature contract (canonical_bytes / challenge_digest) can
+# never drift between them.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+hex = "0.4"

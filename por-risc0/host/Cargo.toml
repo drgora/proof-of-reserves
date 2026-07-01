@@ -3,14 +3,22 @@ name = "host"
 version = "0.1.0"
 edition = "2021"
 
-# GPU proving: `cargo run --release --features cuda --bin host` (needs the CUDA
+# The prover binary lives at src/main.rs but is named `prover` (the package/lib stays
+# `host` so the bins can `use host::{attest, verify}`).
+[[bin]]
+name = "prover"
+path = "src/main.rs"
+
+# GPU proving: `cargo run --release --features cuda --bin prover` (needs the CUDA
 # toolkit + matching NVIDIA driver on the host). Default build stays CPU-only.
 [features]
 cuda = ["risc0-zkvm/cuda"]
 
 [dependencies]
 methods = { path = "../methods" }
+por-types = { path = "../por-types" }
 risc0-zkvm = { version = "^3.0.4" }
+rand = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = "1.0"
 ciborium = "0.2.2"
@@ -34,7 +42,7 @@ spansy = { git = "https://github.com/tlsnotary/tlsn-utils", rev = "64722f7" }
 tokio = { version = "1.38", features = ["rt", "rt-multi-thread", "macros", "net", "io-std", "io-util"] }
 tokio-util = "0.7"
 futures = "0.3"
-hyper = { version = "1.1", features = ["client", "http1"] }
+hyper = { version = "1.1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 bincode = "1.3"
