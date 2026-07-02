@@ -133,6 +133,15 @@ fn prove_block(
     seg_po2: u32,
     presentation_b64: Option<String>,
 ) -> Value {
+    // Marketplace binding inputs (per-agent constants). Default to 0 / zero-secret when
+    // unset -- legacy/demo runs don't record on the marketplace, so the values are inert.
+    let agent_token_id: u64 =
+        std::env::var("POR_AGENT_TOKEN_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let agent_secret: [u8; 32] = std::env::var("POR_AGENT_SECRET")
+        .ok()
+        .map(|h| hexb(&h).try_into().expect("POR_AGENT_SECRET must be 32-byte hex"))
+        .unwrap_or([0u8; 32]);
+
     let env = ExecutorEnv::builder()
         .segment_limit_po2(seg_po2)
         .write(&inputs.header_rlp).unwrap()
@@ -148,6 +157,8 @@ fn prove_block(
         .write(&debug).unwrap()
         .write(challenge_nonce).unwrap()
         .write(agent_id).unwrap()
+        .write(&agent_token_id).unwrap() // marketplace ERC-721 token id
+        .write(&agent_secret).unwrap()   // private agent secret (identity binding)
         .build().unwrap();
 
     let t = Instant::now();

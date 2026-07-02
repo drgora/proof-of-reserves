@@ -50,6 +50,10 @@ pub struct Journal {
     /// keccak256(registry agent id)
     pub agent_id: [u8; 32],
     pub block_number: u64,
+    /// marketplace ERC-721 token id (HL ValidationGatewayV2 agentId binding)
+    pub agent_token_id: u64,
+    /// keccak256(agent_secret) as [u64;4] limbs (gateway identity binding)
+    pub identity: [u64; 4],
 }
 
 /// Decode the CBOR receipt out of a `proof.json`-shaped bundle (`proofData.proof`).
@@ -70,15 +74,17 @@ pub fn verify_receipt(receipt: &Receipt) -> Result<()> {
 
 /// Decode the public journal (the guest's `env::commit` sequence, positional).
 pub fn decode_journal(receipt: &Receipt) -> Result<Journal> {
-    let (block_hash, threshold, chain_id, debug, challenge_nonce, agent_id, block_number): (
-        [u8; 32],
-        u128,
-        u32,
-        bool,
-        [u8; 32],
-        [u8; 32],
-        u64,
-    ) = receipt
+    let (
+        block_hash,
+        threshold,
+        chain_id,
+        debug,
+        challenge_nonce,
+        agent_id,
+        block_number,
+        agent_token_id,
+        identity,
+    ): ([u8; 32], u128, u32, bool, [u8; 32], [u8; 32], u64, u64, [u64; 4]) = receipt
         .journal
         .decode()
         .map_err(|e| anyhow!("decode journal: {e}"))?;
@@ -90,6 +96,8 @@ pub fn decode_journal(receipt: &Receipt) -> Result<Journal> {
         challenge_nonce,
         agent_id,
         block_number,
+        agent_token_id,
+        identity,
     })
 }
 

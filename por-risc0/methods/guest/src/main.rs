@@ -65,6 +65,9 @@ fn main() {
     // is keccak256(registry agent id).
     let challenge_nonce: [u8; 32] = env::read();
     let agent_id: [u8; 32] = env::read();
+    // Marketplace (HL ValidationGatewayV2) binding fields.
+    let agent_token_id: u64 = env::read(); // PUBLIC: ERC-721 token id from IdentityRegistry
+    let agent_secret: [u8; 32] = env::read(); // PRIVATE: never committed raw
 
     // Header hash + fields (state_root, block number) from the attested RLP.
     let block_hash = keccak256(&header_rlp);
@@ -113,4 +116,15 @@ fn main() {
     env::commit(&challenge_nonce);
     env::commit(&agent_id);
     env::commit(&fields.number);
+
+    // Marketplace public signals, committed CONTIGUOUSLY so the gateway's fixed-length
+    // _extractField can read them (a [u8;32] would word-expand to 128 non-contiguous bytes).
+    // identity = keccak256(agent_secret): only the secret holder can produce a journal
+    // matching the registered commitment. keccak (not Poseidon) -- accelerated in-guest, and
+    // the gateway checks value==commitment, not which hash produced it.
+    let identity = keccak256(&agent_secret);
+    let id_limbs: [u64; 4] =
+        core::array::from_fn(|i| u64::from_le_bytes(identity[i * 8..i * 8 + 8].try_into().unwrap()));
+    env::commit(&agent_token_id); // u64     -> 8 contiguous LE bytes
+    env::commit(&id_limbs); // [u64;4] -> 32 contiguous bytes
 }

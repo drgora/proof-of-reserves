@@ -99,6 +99,8 @@ fn make_env(
         .write(&debug).unwrap()
         .write(challenge_nonce).unwrap()
         .write(agent_id).unwrap()
+        .write(&0u64).unwrap() // marketplace token id (inert in the selftest)
+        .write(&[0u8; 32]).unwrap() // agent secret (inert in the selftest)
         .build()
         .unwrap()
 }
@@ -161,8 +163,8 @@ fn main() {
     let session = exec
         .execute(make_env(&w, &sig65, threshold, chain_id, false, &challenge_nonce, &agent_id), POR_GUEST_ELF)
         .expect("positive ownership execution failed");
-    let (jbh, jth, jcid, jdbg, jnonce, jagent, jnum): (
-        [u8; 32], u128, u32, bool, [u8; 32], [u8; 32], u64,
+    let (jbh, jth, jcid, jdbg, jnonce, jagent, jnum, _jtid, _jid): (
+        [u8; 32], u128, u32, bool, [u8; 32], [u8; 32], u64, u64, [u64; 4],
     ) = session.journal.decode().expect("journal decode");
     assert_eq!(jbh, w.block_hash, "journal block_hash mismatch");
     assert_eq!(jth, threshold);
@@ -175,9 +177,10 @@ fn main() {
     let jbytes = session.journal.bytes.clone();
     assert!(!jbytes.windows(20).any(|w2| w2 == address), "address leaked into journal");
     // risc0 serde word-expands every field (each byte of a [u8;32] -> a 4-byte LE word,
-    // u64 -> 2 words), so the journal is 416 bytes, not a 125-byte packed layout.
-    // 128(block_hash)+16(threshold)+4(chain_id)+4(debug)+128(nonce)+128(agent_id)+8(number).
-    assert_eq!(jbytes.len(), 416, "journal layout changed (risc0-serde word-expanded size)");
+    // u64 -> 2 words), so the journal is 456 bytes, not a packed layout. 128(block_hash)+
+    // 16(threshold)+4(chain_id)+4(debug)+128(nonce)+128(agent_id)+8(number)+8(agent_token_id)+
+    // 32(identity [u64;4]) = 456.
+    assert_eq!(jbytes.len(), 456, "journal layout changed (risc0-serde word-expanded size)");
     println!("    OK: in-guest ownership verified; journal {{block_hash, threshold, chain_id, debug=false, challenge_nonce, agent_id, block_number={jnum}}}, addr+balance hidden");
 
     // [2] NEGATIVE: tampered signature.
