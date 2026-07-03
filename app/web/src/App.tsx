@@ -7,7 +7,7 @@ export default function App() {
       <header className="site-header">
         <div className="container">
           <Link to="/" className="brand">
-            <img src="/brand/zkverify-logo-white.svg" alt="zkVerify" />
+            <span className="brand-mark">Horizen Labs</span>
             <span className="divider" />
             <span className="product">
               Proof-of-Reserves <span className="dim">· Verified Agents</span>
