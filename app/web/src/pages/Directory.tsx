@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom'
 import { useDirectory, useOverview, usePipeline } from '../hooks'
-import { fmtNum, fmtPct, timeAgo, type AgentRow, type DirectoryMode } from '../api'
+import { fmtNum, fmtTime, timeAgo, type AgentRow, type DirectoryMode } from '../api'
 import { ErrorBox, Loading, NetworkBadge, PipelineTimeline, PorBadge, TypeBadge, VerifiedBadge } from '../components'
 
 export default function Directory() {
@@ -11,8 +11,12 @@ export default function Directory() {
   const o = overview.data
   const d = dir.data
   const p = pipeline.data
-  const passRate =
-    o && o.receipts.count ? Math.round((o.receipts.validated / o.receipts.count) * 100) : null
+  const challengeCount = d ? d.agents.reduce((n, a) => n + (a.challengeCount ?? 0), 0) : null
+  // The single most recently recorded challenge across all listed agents.
+  const lastPassed = d?.agents
+    .filter((a) => a.lastChallenge)
+    .map((a) => ({ agent: a, c: a.lastChallenge! }))
+    .sort((x, y) => (y.c.recordedAt ?? '').localeCompare(x.c.recordedAt ?? ''))[0]
 
   return (
     <>
@@ -63,10 +67,34 @@ export default function Directory() {
           <div className="label">Quality receipts on-chain</div>
         </div>
         <div className="stat">
-          <div className="num">{fmtPct(passRate)}</div>
-          <div className="label">Lifetime pass rate</div>
+          <div className="num">{challengeCount != null ? fmtNum(challengeCount) : '—'}</div>
+          <div className="label">Challenges passed</div>
         </div>
       </div>
+
+      {lastPassed && (
+        <Link to={`/agent/${lastPassed.agent.agentId}`} className="last-challenge">
+          <div className="lc-head">
+            <span className="lc-label">Last passed challenge</span>
+            <span className="lc-when">{timeAgo(lastPassed.c.recordedAt)}</span>
+          </div>
+          <div className="lc-body">
+            <span className="lc-agent">{lastPassed.agent.name || lastPassed.agent.agentId}</span>{' '}
+            proved <span className="lc-strong">≥ {lastPassed.c.threshold ?? '—'}</span>
+            {lastPassed.c.chain && (
+              <>
+                {' '}on <span className="chip">{lastPassed.c.chain}</span>
+              </>
+            )}
+          </div>
+          {lastPassed.c.first && lastPassed.c.last && (
+            <div className="lc-meta">
+              {lastPassed.c.proofCount} blocks · covered {fmtTime(lastPassed.c.first)} →{' '}
+              {fmtTime(lastPassed.c.last)}
+            </div>
+          )}
+        </Link>
+      )}
 
       {d?.mode === 'fallback-all' && <FallbackNotice porTypeLive={o?.porTypeLive} />}
 
@@ -127,14 +155,18 @@ function AgentCard({ agent, mode }: { agent: AgentRow; mode: DirectoryMode }) {
           <div className="k">Receipts</div>
         </div>
         <div className="metric">
-          <div className="v">{fmtPct(agent.passRatePct)}</div>
-          <div className="k">Pass rate</div>
-        </div>
-        <div className="metric">
-          <div className="v">{fmtPct(agent.slaPct)}</div>
-          <div className="k">7d SLA</div>
+          <div className="v">{fmtNum(agent.challengeCount ?? 0)}</div>
+          <div className="k">Challenges</div>
         </div>
       </div>
+
+      {agent.lastChallenge && (
+        <div className="card-last">
+          Last: ≥ {agent.lastChallenge.threshold ?? '—'}
+          {agent.lastChallenge.chain ? ` on ${agent.lastChallenge.chain}` : ''} ·{' '}
+          {agent.lastChallenge.proofCount} blocks
+        </div>
+      )}
 
       <div className="foot">Last activity {timeAgo(agent.lastActivity)}</div>
     </Link>

@@ -1,14 +1,23 @@
 // REST client for the local read-proxy (server.mjs), which wraps the HL Agent
 // Registry MCP API. All endpoints are GET + JSON.
 
+export type ChallengeSummary = {
+  nonce: string | null
+  chain: string | null
+  threshold: string | null // formatted, e.g. "0.09 ETH"
+  proofCount: number
+  first: string | null // earliest reference block covered
+  last: string | null // latest reference block covered
+  recordedAt: string | null // when it landed on-chain
+}
+
 export type AgentRow = {
   agentId: string
   name: string
   type: string | null
   receipts: number
-  passRatePct: number | null
-  slaPct: number | null
-  slaWindow?: { bpsSum: number; total: number }
+  challengeCount?: number
+  lastChallenge?: ChallengeSummary | null
   lastActivity: string | null
   proofTypes?: string[]
 }
@@ -63,6 +72,18 @@ export type Receipt = {
   // not surface it.
   validationTxHash?: string
   validationId?: number
+  // Decoded guest journal (the proof's public inputs) — what this proof attests.
+  publicInputs?: {
+    threshold: string // formatted, e.g. "0.09 ETH"
+    thresholdWei: string
+    chainId: number
+    chain: string // display name, e.g. "Sepolia"
+    blockNumber: number // reference block height
+    blockUrl?: string | null
+    blockTimestamp?: string | null // reference block's time on the proven chain
+    challengeNonce?: string // shared by all proofs of one challenge (grouping key)
+    ownershipProven?: boolean // false when debug (public/demo) mode
+  }
 }
 
 export type AgentDetail = {

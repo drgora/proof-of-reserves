@@ -203,6 +203,116 @@ function decodeEventProofType(data) {
   }
 }
 
+// --- public inputs (the guest journal, decoded from the recordValidation calldata) ---
+// The journal is committed by the risc0 guest and passed to recordValidation as `pubsBytes`.
+// We fetch the validation tx, pull `pubsBytes` out of the calldata, and decode the risc0-serde
+// journal so the UI can show what each proof actually attests: threshold, chain, reference block.
+// Journal layout (risc0 word-expands byte arrays to 1 word/byte; scalars stay native LE words):
+//   block_hash[32]·threshold u128·chain_id u32·debug bool·challenge_nonce[32]·agent_id[32]·
+//   block_number u64·agent_token_id u64·identity[u64;4]  = 114 words / 456 bytes.
+const CHAINS = {
+  1: { name: 'Ethereum', symbol: 'ETH', explorer: 'https://etherscan.io', rpc: 'https://eth.drpc.org' },
+  10: { name: 'Optimism', symbol: 'ETH', explorer: 'https://optimistic.etherscan.io', rpc: 'https://optimism.drpc.org' },
+  56: { name: 'BNB Chain', symbol: 'BNB', explorer: 'https://bscscan.com', rpc: 'https://bsc.drpc.org' },
+  137: { name: 'Polygon', symbol: 'POL', explorer: 'https://polygonscan.com', rpc: 'https://polygon.drpc.org' },
+  8453: { name: 'Base', symbol: 'ETH', explorer: 'https://basescan.org', rpc: 'https://base.drpc.org' },
+  11155111: { name: 'Sepolia', symbol: 'ETH', explorer: 'https://sepolia.etherscan.io', rpc: 'https://sepolia.drpc.org' },
+  11155420: { name: 'OP Sepolia', symbol: 'ETH', explorer: 'https://sepolia-optimism.etherscan.io', rpc: 'https://optimism-sepolia.drpc.org' },
+  84532: { name: 'Base Sepolia', symbol: 'ETH', explorer: 'https://sepolia.basescan.org', rpc: 'https://base-sepolia.drpc.org' },
+}
+// Timestamp of a block on the PROVEN chain (not Base) — for the challenge coverage window.
+// Override a chain's endpoint with POR_CHAIN_RPC_<id>. Cached (block times are immutable).
+const chainTsCache = new Map() // `${chainId}:${block}` -> ISO|null
+async function chainBlockTimestamp(chainId, blockNumber) {
+  const key = `${chainId}:${blockNumber}`
+  if (chainTsCache.has(key)) return chainTsCache.get(key)
+  const url = process.env[`POR_CHAIN_RPC_${chainId}`] || CHAINS[chainId]?.rpc
+  if (!url) {
+    chainTsCache.set(key, null)
+    return null
+  }
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getBlockByNumber',
+        params: ['0x' + blockNumber.toString(16), false],
+      }),
+      signal: AbortSignal.timeout(5000),
+    })
+    const j = await res.json()
+    const iso = j.result?.timestamp
+      ? new Date(parseInt(j.result.timestamp, 16) * 1000).toISOString()
+      : null
+    chainTsCache.set(key, iso)
+    return iso
+  } catch {
+    chainTsCache.set(key, null)
+    return null
+  }
+}
+function formatWei(wei) {
+  const v = BigInt(wei)
+  const whole = v / 10n ** 18n
+  const frac = (v % 10n ** 18n).toString().padStart(18, '0').replace(/0+$/, '')
+  return frac ? `${whole}.${frac}` : `${whole}`
+}
+// Pull the `bytes pubsBytes` argument (tuple head index 10) out of recordValidation calldata.
+function extractPubsBytes(input) {
+  const body = input.slice(2 + 8) // strip 0x + 4-byte selector
+  const tupleOff = Number(BigInt('0x' + body.slice(0, 64)))
+  const tuple = body.slice(tupleOff * 2)
+  const off = Number(BigInt('0x' + tuple.slice(10 * 64, 10 * 64 + 64)))
+  const at = off * 2
+  const len = Number(BigInt('0x' + tuple.slice(at, at + 64)))
+  return '0x' + tuple.slice(at + 64, at + 64 + len * 2)
+}
+function decodeJournal(pubsHex) {
+  const b = Buffer.from(pubsHex.slice(2), 'hex')
+  const word = (i) => b.readUInt32LE(i * 4)
+  const u64 = (w) => BigInt(word(w)) | (BigInt(word(w + 1)) << 32n)
+  let w = 0
+  w += 32 // block_hash [u8;32]
+  let threshold = 0n
+  for (let k = 0; k < 4; k++) threshold |= BigInt(word(w + k)) << BigInt(32 * k) // u128
+  w += 4
+  const chain_id = word(w); w += 1
+  const debug = word(w); w += 1
+  const bytes32 = (at) => {
+    let s = '0x'
+    for (let k = 0; k < 32; k++) s += (word(at + k) & 0xff).toString(16).padStart(2, '0')
+    return s
+  }
+  const challenge_nonce = bytes32(w); w += 32
+  w += 32 // agent_id
+  const block_number = u64(w); w += 2
+  return { threshold: threshold.toString(), chain_id, debug, challenge_nonce, block_number: Number(block_number) }
+}
+async function resolvePublicInputs(item) {
+  try {
+    const tx = await rpc('eth_getTransactionByHash', [item.validationTxHash])
+    if (!tx?.input) return
+    const j = decodeJournal(extractPubsBytes(tx.input))
+    const c = CHAINS[j.chain_id] || { name: `chain ${j.chain_id}`, symbol: '', explorer: null }
+    item.publicInputs = {
+      threshold: `${formatWei(j.threshold)}${c.symbol ? ` ${c.symbol}` : ''}`,
+      thresholdWei: j.threshold,
+      chainId: j.chain_id,
+      chain: c.name,
+      blockNumber: j.block_number,
+      blockUrl: c.explorer ? `${c.explorer}/block/${j.block_number}` : null,
+      blockTimestamp: await chainBlockTimestamp(j.chain_id, j.block_number),
+      challengeNonce: j.challenge_nonce,
+      ownershipProven: !j.debug,
+    }
+  } catch {
+    /* leave publicInputs undefined; UI shows — */
+  }
+}
+
 // agentHex -> Map(validationId -> receipt); cursor makes refreshes incremental.
 const store = { cursor: null, byAgent: new Map(), lastScan: 0, inflight: null }
 const padAgentTopic = (id) => '0x' + BigInt(id).toString(16).padStart(64, '0')
@@ -270,13 +380,14 @@ async function receiptsFor(hexId) {
   await ensureScan()
   const m = store.byAgent.get(hexId.toLowerCase())
   const items = m ? [...m.values()].sort((a, b) => b.blockNumber - a.blockNumber) : []
-  await Promise.all(
-    items
+  await Promise.all([
+    ...items
       .filter((it) => it.timestamp == null)
       .map(async (it) => {
         it.timestamp = await blockTimestamp(it.blockNumber)
       }),
-  )
+    ...items.filter((it) => !it.publicInputs).map(resolvePublicInputs),
+  ])
   return {
     count: items.length,
     validated: items.length,
@@ -319,16 +430,45 @@ async function getAgentDetail(agentId) {
   }
 }
 
+// Group an agent's receipts into challenges (shared challenge_nonce) and summarize each —
+// used for the directory's "last passed challenge" overview + challenge counts.
+function summarizeChallenges(items) {
+  const g = new Map()
+  for (const it of items) {
+    const key = it.publicInputs?.challengeNonce || `solo:${it.id}`
+    const arr = g.get(key)
+    if (arr) arr.push(it)
+    else g.set(key, [it])
+  }
+  const challenges = [...g.entries()].map(([, its]) => {
+    const times = its.map((x) => x.publicInputs?.blockTimestamp).filter(Boolean).sort()
+    const recs = its.map((x) => x.timestamp).filter(Boolean).sort()
+    const pi = its[0].publicInputs || {}
+    return {
+      nonce: pi.challengeNonce ?? null,
+      chain: pi.chain ?? null,
+      threshold: pi.threshold ?? null,
+      proofCount: its.length,
+      first: times[0] ?? null, // earliest reference block covered
+      last: times[times.length - 1] ?? null, // latest reference block covered
+      recordedAt: recs[recs.length - 1] ?? null, // when it landed on-chain (recency key)
+    }
+  })
+  challenges.sort((a, b) => (b.recordedAt ?? '').localeCompare(a.recordedAt ?? '')) // newest first
+  return challenges
+}
+
 function detailToRow(detail) {
   const a = detail.agent || {}
   const items = detail.receipts?.items || []
+  const challenges = summarizeChallenges(items)
   return {
     agentId: a.agentId,
     name: a.name,
     type: null,
     receipts: detail.receipts?.count ?? 0,
-    passRatePct: detail.receipts?.passRatePct ?? null,
-    slaPct: null,
+    challengeCount: challenges.length,
+    lastChallenge: challenges[0] ?? null,
     lastActivity: items[0]?.timestamp ?? null,
     proofTypes: detail.whatThisProves?.proofTypes || [],
   }

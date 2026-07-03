@@ -1,9 +1,9 @@
 import type { ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useAgent } from '../hooks'
-import { fmtNum, fmtPct, fmtTime, shortHash, txUrl, type Receipt } from '../api'
+import { fmtNum, fmtTime, shortHash, type Receipt } from '../api'
 import { baseAddressUrl, baseTxUrl, marketplaceAgentUrl } from '../chain'
-import { ErrorBox, Loading, NetworkBadge, PorBadge, SlaMeter, TypeBadge, VerifiedBadge } from '../components'
+import { ErrorBox, Loading, NetworkBadge, PorBadge, TypeBadge, VerifiedBadge } from '../components'
 
 export default function AgentDetail() {
   const { agentId } = useParams()
@@ -16,7 +16,6 @@ export default function AgentDetail() {
 
   const a = d.agent
   const r = d.receipts
-  const slaPct = d.stats?.slaPct ?? null
 
   return (
     <>
@@ -48,15 +47,6 @@ export default function AgentDetail() {
         <div className="bigmetric">
           <div className="v">{fmtNum(r.count)}</div>
           <div className="k">Quality receipts ({fmtNum(r.validated)} passed · {fmtNum(r.failed)} failed)</div>
-        </div>
-        <div className="bigmetric">
-          <div className={'v' + (r.passRatePct === 100 ? ' good' : '')}>{fmtPct(r.passRatePct)}</div>
-          <div className="k">Lifetime pass rate</div>
-        </div>
-        <div className="bigmetric">
-          <div className={'v' + (slaPct === 100 ? ' good' : '')}>{fmtPct(slaPct)}</div>
-          <div className="k">Last-7-day uptime SLA</div>
-          {slaPct != null && <SlaMeter pct={slaPct} />}
         </div>
       </div>
 
@@ -126,69 +116,141 @@ export default function AgentDetail() {
 
         <div className="panel full">
           <h3>Quality receipts {r.returned < r.count ? `(latest ${r.returned} of ${r.count})` : `(${r.count})`}</h3>
-          <ReceiptsTable items={r.items} explorer={d.explorer} baseExplorer={d.baseExplorer} />
+          <ChallengeList items={r.items} baseExplorer={d.baseExplorer} />
         </div>
       </div>
     </>
   )
 }
 
-function ReceiptsTable({
-  items,
-  explorer,
-  baseExplorer,
-}: {
+type Challenge = {
+  key: string
+  nonce: string | null
+  chain: string | null
+  threshold: string | null
+  proofType: string | null
+  first: string | null
+  last: string | null
   items: Receipt[]
-  explorer: string
-  baseExplorer?: string
-}) {
+}
+
+// Group proofs that answer the same challenge (shared challenge_nonce in the journal).
+// Proofs without decoded public inputs fall back to a group of their own.
+function groupByChallenge(items: Receipt[]): Challenge[] {
+  const groups = new Map<string, Receipt[]>()
+  for (const it of items) {
+    const key = it.publicInputs?.challengeNonce || `solo:${it.id}`
+    const arr = groups.get(key)
+    if (arr) arr.push(it)
+    else groups.set(key, [it])
+  }
+  const challenges = [...groups.entries()].map(([key, its]) => {
+    const times = its
+      .map((x) => x.publicInputs?.blockTimestamp)
+      .filter((t): t is string => !!t)
+      .sort()
+    const pi = its[0].publicInputs
+    return {
+      key,
+      nonce: pi?.challengeNonce ?? null,
+      chain: pi?.chain ?? null,
+      threshold: pi?.threshold ?? null,
+      proofType: its[0].proofType ?? null,
+      first: times[0] ?? null,
+      last: times[times.length - 1] ?? null,
+      // proofs newest reference block first
+      items: its
+        .slice()
+        .sort((a, b) => (b.publicInputs?.blockNumber ?? 0) - (a.publicInputs?.blockNumber ?? 0)),
+    }
+  })
+  // newest challenge first (by latest reference block covered)
+  challenges.sort((a, b) => (b.last ?? '').localeCompare(a.last ?? ''))
+  return challenges
+}
+
+function ChallengeList({ items, baseExplorer }: { items: Receipt[]; baseExplorer?: string }) {
   if (!items?.length) return <div style={{ color: 'var(--muted)' }}>No receipts.</div>
   return (
-    <div className="table-wrap">
-      <table className="receipts">
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Score</th>
-            <th>Proof type</th>
-            <th>When</th>
-            <th>zkVerify tx</th>
-            <th>On-chain validation</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((it) => (
-            <tr key={it.id}>
-              <td>
-                <span className={`status ${it.status}`}>{it.status}</span>
-              </td>
-              <td>{fmtPct(it.scorePct)}</td>
-              <td>
-                <span className="chip">{it.proofType}</span>
-              </td>
-              <td>{fmtTime(it.timestamp)}</td>
-              <td className="mono">
-                {it.zkVerify?.txHash ? (
-                  <a href={txUrl(explorer, it.zkVerify.txHash)} target="_blank" rel="noreferrer">
-                    {shortHash(it.zkVerify.txHash)} ↗
-                  </a>
-                ) : (
-                  '—'
-                )}
-              </td>
-              <td className="mono">
-                {it.validationTxHash ? (
-                  <a href={baseTxUrl(baseExplorer, it.validationTxHash)} target="_blank" rel="noreferrer">
-                    {shortHash(it.validationTxHash)} ↗
-                  </a>
-                ) : (
-                  '—'
-                )}
-              </td>
+    <div className="challenges">
+      {groupByChallenge(items).map((c) => (
+        <ChallengeCard key={c.key} c={c} baseExplorer={baseExplorer} />
+      ))}
+    </div>
+  )
+}
+
+function ChallengeCard({ c, baseExplorer }: { c: Challenge; baseExplorer?: string }) {
+  return (
+    <div className="challenge">
+      <div className="challenge-head">
+        <span className="challenge-title">
+          {c.nonce ? (
+            <>
+              Challenge <span className="mono">{shortHash(c.nonce)}</span>
+            </>
+          ) : (
+            'Proof'
+          )}
+        </span>
+        {c.proofType && <span className="chip">{c.proofType}</span>}
+        {c.chain && <span className="chip">{c.chain}</span>}
+        {c.threshold && <span className="challenge-badge">Proved ≥ {c.threshold}</span>}
+        <span className="challenge-meta">
+          {c.items.length} proof{c.items.length > 1 ? 's' : ''}
+        </span>
+        {c.first && c.last && (
+          <span className="challenge-meta">
+            Covered {fmtTime(c.first)} → {fmtTime(c.last)}
+          </span>
+        )}
+      </div>
+      <div className="table-wrap">
+        <table className="receipts">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Reference block</th>
+              <th>Block time</th>
+              <th>Recorded</th>
+              <th>On-chain validation</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {c.items.map((it) => (
+              <tr key={it.id}>
+                <td>
+                  <span className={`status ${it.status}`}>{it.status}</span>
+                </td>
+                <td className="mono">
+                  {it.publicInputs ? (
+                    it.publicInputs.blockUrl ? (
+                      <a href={it.publicInputs.blockUrl} target="_blank" rel="noreferrer">
+                        {it.publicInputs.blockNumber} ↗
+                      </a>
+                    ) : (
+                      it.publicInputs.blockNumber
+                    )
+                  ) : (
+                    '—'
+                  )}
+                </td>
+                <td>{it.publicInputs?.blockTimestamp ? fmtTime(it.publicInputs.blockTimestamp) : '—'}</td>
+                <td>{fmtTime(it.timestamp)}</td>
+                <td className="mono">
+                  {it.validationTxHash ? (
+                    <a href={baseTxUrl(baseExplorer, it.validationTxHash)} target="_blank" rel="noreferrer">
+                      {shortHash(it.validationTxHash)} ↗
+                    </a>
+                  ) : (
+                    '—'
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
