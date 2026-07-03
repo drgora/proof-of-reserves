@@ -120,6 +120,28 @@ fn wallet_sig(header_rlp: &[u8], key: &Option<SigningKey>) -> Vec<u8> {
     v
 }
 
+// Refuse impossible proofs cleanly, before the (slow) attestation + proving. A wallet that
+// can't meet the threshold -- including one that doesn't exist (balance 0, an MPT *exclusion*
+// proof) -- makes the guest correctly refuse; without this that surfaces as an ugly panic +
+// backtrace through prove()'s unwrap. Exit with a clear message instead.
+fn ensure_can_prove(balance: u128, threshold: u128, debug: bool) {
+    if !debug && balance < threshold {
+        eprintln!(
+            "\ncannot prove reserves: balance {balance} wei < threshold {threshold} wei{}",
+            if balance == 0 {
+                " (the account does not exist / holds nothing at this block)"
+            } else {
+                ""
+            }
+        );
+        eprintln!(
+            "hint: use a wallet funded above the threshold across the whole challenge window, \
+             or run DEMO mode (unset POR_PRIVATE_KEY)."
+        );
+        std::process::exit(1);
+    }
+}
+
 // Prove one block -> a proof.json-shaped bundle (optionally carrying a TLSNotary presentation).
 #[allow(clippy::too_many_arguments)]
 fn prove_block(
@@ -162,8 +184,15 @@ fn prove_block(
         .build().unwrap();
 
     let t = Instant::now();
-    let receipt = default_prover()
-        .prove_with_opts(env, POR_GUEST_ELF, &ProverOpts::succinct()).unwrap().receipt;
+    // Backstop: if the guest still refuses here (e.g. balance below threshold, or an
+    // absent-account MPT exclusion proof), exit cleanly instead of unwrapping into a panic.
+    let receipt = match default_prover().prove_with_opts(env, POR_GUEST_ELF, &ProverOpts::succinct()) {
+        Ok(info) => info.receipt,
+        Err(e) => {
+            eprintln!("\ncannot prove this block: {e}");
+            std::process::exit(1);
+        }
+    };
     receipt.verify(POR_GUEST_ID).unwrap();
 
     let j = &receipt.journal.bytes;
@@ -301,9 +330,7 @@ async fn prove_challenge(
         let block_hex = format!("0x{blk:x}");
         println!("[block {}/{}] {block_hex} (#{blk})", i + 1, ch.blocks.len());
         let inputs = fetch_block(&block_hex, addr_hex);
-        if !debug && inputs.balance < threshold {
-            eprintln!("  WARNING: balance {} < threshold at block {blk}; the guest will reject", inputs.balance);
-        }
+        ensure_can_prove(inputs.balance, threshold, debug);
         let sig = wallet_sig(&inputs.header_rlp, owner_key);
         let presentation = maybe_attest(&block_hex).await;
         let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
@@ -402,9 +429,7 @@ async fn run_legacy_single(
         "legacy single-block mode: {mode}\naddress {addr_hex}, block {block_num}, depth {}, balance {} ETH, threshold {} ETH",
         inputs.account_proof.len(), inputs.balance as f64 / 1e18, threshold as f64 / 1e18
     );
-    if !debug && inputs.balance < threshold {
-        eprintln!("WARNING: balance < threshold; the guest will reject this proof");
-    }
+    ensure_can_prove(inputs.balance, threshold, debug);
 
     let sig = wallet_sig(&inputs.header_rlp, owner_key);
     // No challenge in legacy mode -> placeholder journal labels.
