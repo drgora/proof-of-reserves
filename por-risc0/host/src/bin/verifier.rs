@@ -16,11 +16,15 @@
 // Env: VERIFIER_ADDR (default 127.0.0.1:7100), POR_REGISTRY_URL (default
 //   http://127.0.0.1:8090), POR_WINDOW_DAYS (default 3), POR_SLOT_SECONDS (default 12),
 //   POR_ALLOW_DEBUG, POR_ALLOW_UNVERIFIED_OWNER (dev: accept a placeholder registry owner),
-//   POR_ALLOW_NO_PRESENTATION (dev: accept bundles without a TLSNotary presentation).
+//   POR_ALLOW_NO_PRESENTATION (dev: accept bundles without a TLSNotary presentation),
+//   POR_SUBMITTER_URL (if set, e.g. http://127.0.0.1:8092 -> on a verified verdict, auto-POST
+//     the verified bundles to the marketplace submitter's /submit, which drives Kurier ->
+//     aggregation -> attestation relay -> recordValidation on Base Sepolia).
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Write;
 use std::net::SocketAddr;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -151,6 +155,27 @@ fn curl_get(url: &str) -> Vec<u8> {
         .output()
         .map(|o| o.stdout)
         .unwrap_or_default()
+}
+
+/// POST a JSON body to `url`, streaming it via stdin (`--data-binary @-`). The bundles carry
+/// ~MB CBOR receipts, far over MAX_ARG_STRLEN, so the body cannot go on the argv.
+fn curl_post_stdin(url: &str, body: &[u8]) -> Vec<u8> {
+    let mut child = match Command::new("curl")
+        .args([
+            "-s", "-m", "60", "-X", "POST", "-H", "content-type: application/json",
+            "--data-binary", "@-", url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    if let Some(mut sin) = child.stdin.take() {
+        let _ = sin.write_all(body);
+    } // stdin dropped here -> EOF
+    child.wait_with_output().map(|o| o.stdout).unwrap_or_default()
 }
 
 /// (found, owner) for an agent id. `found=false` when the registry has no such agent.
@@ -384,9 +409,11 @@ async fn handle_submit(state: &Arc<AppState>, id: &str, body: &[u8]) -> (StatusC
     let allow_unverified = state.allow_unverified_owner;
     let allow_no_pres = state.allow_no_presentation;
 
-    // If Kurier settle is enabled, keep the bundles for the background task (resp is about to
-    // be moved into the verification closure).
-    let kurier_bundles = std::env::var("KURIER_API_KEY").is_ok().then(|| resp.bundles.clone());
+    // Keep the bundles for background post-processing -- Kurier settle and/or forwarding to the
+    // marketplace submitter -- since `resp` is about to be moved into the verification closure.
+    let kurier_on = std::env::var("KURIER_API_KEY").is_ok();
+    let submitter_url = std::env::var("POR_SUBMITTER_URL").ok();
+    let saved_bundles = (kurier_on || submitter_url.is_some()).then(|| resp.bundles.clone());
 
     // Verification (receipt.verify x3 + presentation checks) is CPU-bound: off the runtime.
     let result = tokio::task::spawn_blocking(move || {
@@ -401,11 +428,21 @@ async fn handle_submit(state: &Arc<AppState>, id: &str, body: &[u8]) -> (StatusC
         Ok(()) => {
             s.state = State::Verified;
             s.verdict = Some("verified".into());
-            // Settle on zkVerify only what we verified -- in the background (Kurier polls to
-            // inclusion for minutes); the local verdict stands regardless of settlement.
-            if let Some(bundles) = kurier_bundles {
-                s.kurier = KurierState { enabled: true, status: "pending".into(), jobs: vec![] };
-                tokio::spawn(settle_kurier(state.clone(), id.to_string(), bundles));
+            // Background post-processing on the verified bundles (the local verdict stands
+            // regardless). Both paths take minutes; neither blocks the response.
+            if let Some(bundles) = saved_bundles {
+                if kurier_on {
+                    // zkVerify settle here + (optionally) forward to the submitter for Base.
+                    s.kurier = KurierState { enabled: true, status: "pending".into(), jobs: vec![] };
+                    if let Some(url) = submitter_url {
+                        tokio::spawn(forward_to_submitter(url, id.to_string(), bundles.clone()));
+                    }
+                    tokio::spawn(settle_kurier(state.clone(), id.to_string(), bundles));
+                } else if let Some(url) = submitter_url {
+                    // Submitter owns the whole Kurier->Base path (it submits with chainId), so no
+                    // separate zkVerify settle here -- avoids submitting the same proof twice.
+                    tokio::spawn(forward_to_submitter(url, id.to_string(), bundles));
+                }
             }
             println!("[verify] {id}: VERIFIED");
             (StatusCode::OK, json!({"challenge_id": id, "verdict": "verified"}))
@@ -441,6 +478,26 @@ async fn settle_kurier(state: Arc<AppState>, id: String, bundles: Vec<Value>) {
         s.kurier.status = if all_ok { "settled".into() } else { "failed".into() };
         s.kurier.jobs = jobs;
         println!("[kurier] {id}: {}", s.kurier.status);
+    }
+}
+
+// Background: hand the verified bundles to the marketplace submitter's /submit endpoint, which
+// drives Kurier(chainId) -> aggregation -> attestation relay -> recordValidation on Base Sepolia.
+// Fire-and-forget: the submitter tracks its own pipeline; the challenge verdict is independent.
+async fn forward_to_submitter(url: String, id: String, bundles: Vec<Value>) {
+    let n = bundles.len();
+    let base = url.trim_end_matches('/').to_string();
+    let submit_url = format!("{base}/submit");
+    let payload = json!({ "bundles": bundles }).to_string();
+    let out = tokio::task::spawn_blocking(move || curl_post_stdin(&submit_url, payload.as_bytes()))
+        .await
+        .unwrap();
+    match serde_json::from_slice::<Value>(&out) {
+        Ok(v) => println!("[submitter] {id}: forwarded {n} bundle(s) -> {v}"),
+        Err(_) => eprintln!(
+            "[submitter] {id}: forward to {base}/submit failed or returned non-JSON: {}",
+            String::from_utf8_lossy(&out)
+        ),
     }
 }
 

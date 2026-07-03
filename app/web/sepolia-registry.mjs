@@ -39,6 +39,11 @@ const NETWORK = process.env.POR_NETWORK || 'Base Sepolia'
 const ZKVERIFY_EXPLORER = process.env.ZKVERIFY_EXPLORER || 'https://zkverify-testnet.subscan.io'
 const BASESCAN_URL = process.env.BASESCAN_URL || 'https://sepolia.basescan.org'
 const MARKETPLACE_URL = process.env.MARKETPLACE_URL || 'https://agent-registry.horizenlabs.io'
+// Submitter status source (submitter.mjs /pipeline). It reports what it actually
+// recorded on Base (real recordValidation tx hashes) — the receipt source until a
+// pure on-chain ValidationRegistry log scan is wired (needs the event ABI).
+const PIPELINE_URL = process.env.PIPELINE_URL || ''
+const PROOF_TYPE = process.env.POR_PROOF_TYPE || 'proof-of-reserves'
 
 // --- chain reads -----------------------------------------------------------
 
@@ -113,6 +118,54 @@ function decodeAbiString(hex) {
   return bytes.toString('utf8')
 }
 
+// --- receipts from the submitter's recorded validations --------------------
+// The submitter (submitter.mjs) reports each validation it recorded on Base. We
+// read its /pipeline and turn VERIFIED jobs into receipts, keyed by agentId. This
+// is the on-chain truth (real recordValidation tx hashes) surfaced without an
+// event-log decode; a pure ValidationRegistry scan can replace this later.
+let pipelineCache = { at: 0, jobs: [] }
+async function pipelineJobs() {
+  if (!PIPELINE_URL) return []
+  if (Date.now() - pipelineCache.at < 2000) return pipelineCache.jobs
+  try {
+    const res = await fetch(PIPELINE_URL, { signal: AbortSignal.timeout(4000) })
+    const data = await res.json()
+    pipelineCache = { at: Date.now(), jobs: Array.isArray(data) ? data : data.jobs || [] }
+  } catch {
+    pipelineCache = { at: Date.now(), jobs: pipelineCache.jobs } // keep last good on error
+  }
+  return pipelineCache.jobs
+}
+function jobToReceipt(job, i) {
+  return {
+    id: job.validationId != null ? `val-${job.validationId}` : `${job.agentId}-r${i}`,
+    status: 'validated',
+    scorePct: null,
+    proofType: PROOF_TYPE,
+    timestamp: job.updatedAt || job.submittedAt,
+    zkVerify: job.zkVerifyExtrinsicHash
+      ? { txHash: job.zkVerifyExtrinsicHash, blockHash: job.zkVerifyBlockHash, curve: 'risc0-succinct' }
+      : undefined,
+    validationTxHash: job.validationTxHash,
+    validationId: job.validationId,
+    ethBlockHash: job.ethBlockHash ?? null,
+  }
+}
+async function receiptsFor(hexId) {
+  const id = hexId.toLowerCase()
+  const items = (await pipelineJobs())
+    .filter((j) => j.stage === 'VERIFIED' && String(j.agentId).toLowerCase() === id)
+    .map(jobToReceipt)
+  return {
+    count: items.length,
+    validated: items.length,
+    failed: 0,
+    passRatePct: items.length ? 100 : null,
+    returned: items.length,
+    items,
+  }
+}
+
 // --- structured shapes (mirror server.mjs / the MCP get_agent output) -------
 
 async function getAgentDetail(agentId) {
@@ -120,6 +173,8 @@ async function getAgentDetail(agentId) {
   if (!owner) return null
   const hexId = toHexId(agentId)
   const name = (await tokenName(agentId)) || `Agent #${hexId}`
+  const receipts = await receiptsFor(hexId)
+  const hasReceipts = receipts.count > 0
   return {
     agentId: hexId,
     network: NETWORK,
@@ -129,19 +184,23 @@ async function getAgentDetail(agentId) {
       description: 'No description available',
       owner,
       active: true,
-      zkVerified: false,
-      proofType: null,
+      zkVerified: hasReceipts,
+      proofType: hasReceipts ? PROOF_TYPE : null,
     },
-    whatThisProves: { proofType: null, proofTypes: [], summary: '', claims: [] },
-    // NOTE: receipts are on ValidationRegistry (0x75a7f712…71BC); decoding them
-    // is a later extension. 0 is accurate until a PoR validation is recorded.
-    receipts: { count: 0, validated: 0, failed: 0, passRatePct: null, returned: 0, items: [] },
+    whatThisProves: {
+      proofType: hasReceipts ? PROOF_TYPE : null,
+      proofTypes: hasReceipts ? [PROOF_TYPE] : [],
+      summary: '',
+      claims: [],
+    },
+    receipts,
     reputation: { reviewCount: 0, avgScore: null, feedback: [] },
   }
 }
 
 function detailToRow(detail) {
   const a = detail.agent || {}
+  const items = detail.receipts?.items || []
   return {
     agentId: a.agentId,
     name: a.name,
@@ -149,8 +208,8 @@ function detailToRow(detail) {
     receipts: detail.receipts?.count ?? 0,
     passRatePct: detail.receipts?.passRatePct ?? null,
     slaPct: null,
-    lastActivity: null,
-    proofTypes: [],
+    lastActivity: items[0]?.timestamp ?? null,
+    proofTypes: detail.whatThisProves?.proofTypes || [],
   }
 }
 
@@ -197,6 +256,14 @@ const routes = [
       baseExplorer: BASESCAN_URL,
       marketplace: MARKETPLACE_URL,
     }),
+  },
+  {
+    // Proxy the submitter's live pipeline so the UI's timeline panel lights up.
+    pattern: /^\/api\/pipeline$/,
+    handler: async () => {
+      if (!PIPELINE_URL) return { enabled: false, jobs: [] }
+      return { enabled: true, jobs: await pipelineJobs(), explorer: ZKVERIFY_EXPLORER, baseExplorer: BASESCAN_URL }
+    },
   },
   {
     pattern: /^\/api\/agents$/,
