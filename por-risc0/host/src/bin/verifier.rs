@@ -40,10 +40,9 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use host::verify::{self, Policy};
-use por_types::{Challenge, Response as PorResponse, BLOCK_COUNT};
+use por_types::{chain_spec, expected_host, resolve_chain, selectable_ids, Challenge, Response as PorResponse, BLOCK_COUNT};
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
-const RPC_URL: &str = "https://eth.drpc.org";
 const TTL_SECONDS: u64 = 3600;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,9 +93,28 @@ struct Snapshot {
 struct AppState {
     sessions: Mutex<HashMap<String, Session>>,
     registry_base: String,
-    window_blocks: u64,
+    /// Challenge window in days; converted to blocks per-chain at issue time using the chain's
+    /// block time (so "3 days" is the right block count on a fast L2, not a mainnet-slot count).
+    window_days: u64,
+    /// If set (`POR_SLOT_SECONDS`), overrides every chain's block time -- for tests / tuning.
+    slot_override: Option<u64>,
+    /// Global testnet mode (`POR_TESTNET`): mainnet chain selectors resolve to their paired
+    /// testnet (e.g. requesting chain 1 proves Sepolia). See [`por_types::resolve_chain`].
+    testnet: bool,
     allow_unverified_owner: bool,
     allow_no_presentation: bool,
+}
+
+impl AppState {
+    /// Challenge window in blocks for a chain, from `window_days` and the chain's block time.
+    fn window_blocks(&self, chain_id: u32) -> u64 {
+        let block_time = self
+            .slot_override
+            .or_else(|| chain_spec(chain_id).map(|c| c.block_time_secs))
+            .unwrap_or(12)
+            .max(1);
+        (self.window_days * 86400 / block_time).max(1)
+    }
 }
 
 fn now() -> u64 {
@@ -196,12 +214,12 @@ fn lookup_owner(base: &str, agent_id: &str) -> (bool, Option<[u8; 20]>) {
     (found, owner_str.and_then(parse_addr))
 }
 
-fn rpc_finalized_head() -> Result<u64> {
+fn rpc_finalized_head(rpc_url: &str) -> Result<u64> {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["finalized",false]}"#;
     let out = Command::new("curl")
         .args([
             "-s", "-m", "20", "-X", "POST", "-H", "content-type: application/json", "-H",
-            "accept-encoding: identity", "--data", body, RPC_URL,
+            "accept-encoding: identity", "--data", body, rpc_url,
         ])
         .output()?
         .stdout;
@@ -218,6 +236,7 @@ fn verify_submission(
     snap: &Snapshot,
     resp: &PorResponse,
     policy: &Policy,
+    expected_server: &str,
     allow_unverified_owner: bool,
     allow_no_presentation: bool,
 ) -> Result<()> {
@@ -245,7 +264,7 @@ fn verify_submission(
         // own block number == the journal's committed block_number.
         match b.get("tlsnPresentation").and_then(|v| v.as_str()) {
             Some(b64) => {
-                let att = verify::verify_presentation(b64).map_err(|e| anyhow!("bundle {i}: {e}"))?;
+                let att = verify::verify_presentation(b64, expected_server).map_err(|e| anyhow!("bundle {i}: {e}"))?;
                 verify::bind_block_hash(&att.header_rlp, &j.block_hash)
                     .map_err(|e| anyhow!("bundle {i}: {e}"))?;
                 let hdr_num = verify::header_block_number(&att.header_rlp)
@@ -326,6 +345,26 @@ fn handle_issue(state: &AppState, body: &[u8]) -> (StatusCode, Value) {
         Ok(t) => t,
         Err(_) => return (StatusCode::BAD_REQUEST, json!({"error": "threshold not a u128"})),
     };
+    // Which chain to prove reserves on. Optional (default mainnet selector 1). The requested
+    // value is a SELECTOR; resolve_chain maps it to the effective chain under the testnet flag
+    // (so requesting 1 with POR_TESTNET proves Sepolia). The effective id flows into the
+    // challenge/journal and is bound to its RPC host at submit time.
+    let selector: u32 = match &req["chain_id"] {
+        Value::Null => 1,
+        Value::Number(n) => match n.as_u64().and_then(|v| u32::try_from(v).ok()) {
+            Some(c) => c,
+            None => return (StatusCode::BAD_REQUEST, json!({"error": "chain_id not a u32"})),
+        },
+        Value::String(s) => match s.trim().parse() {
+            Ok(c) => c,
+            Err(_) => return (StatusCode::BAD_REQUEST, json!({"error": "chain_id not a u32"})),
+        },
+        _ => return (StatusCode::BAD_REQUEST, json!({"error": "chain_id must be a number or string"})),
+    };
+    let chain_id = match resolve_chain(selector, state.testnet) {
+        Ok(spec) => spec.chain_id,
+        Err(e) => return (StatusCode::BAD_REQUEST, json!({"error": e, "supported": selectable_ids(state.testnet), "testnet": state.testnet})),
+    };
 
     let (found, owner) = lookup_owner(&state.registry_base, &agent_id);
     if !found && !state.allow_unverified_owner {
@@ -336,12 +375,15 @@ fn handle_issue(state: &AppState, body: &[u8]) -> (StatusCode, Value) {
         eprintln!("WARNING: agent {agent_id} has no parseable owner address; submissions will fail owner auth");
     }
 
-    let head = match rpc_finalized_head() {
+    // Head-pin is a cheap recent-block query -> the header endpoint (drpc) serves it fine; the
+    // verifier never needs the archive proof endpoint (it verifies receipts, doesn't fetch proofs).
+    let rpc_url = verify::header_rpc_url(chain_id).expect("chain validated above");
+    let head = match rpc_finalized_head(&rpc_url) {
         Ok(h) => h,
         Err(e) => return (StatusCode::BAD_GATEWAY, json!({"error": format!("finalized head fetch failed: {e}")})),
     };
     let nonce = rand32();
-    let blocks = match select_blocks(&nonce, head, state.window_blocks) {
+    let blocks = match select_blocks(&nonce, head, state.window_blocks(chain_id)) {
         Ok(b) => b,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": format!("block selection: {e}")})),
     };
@@ -350,7 +392,7 @@ fn handle_issue(state: &AppState, body: &[u8]) -> (StatusCode, Value) {
         challenge_id: hex::encode(rand32())[..32].to_string(),
         agent_id,
         threshold: threshold_str,
-        chain_id: 1,
+        chain_id,
         nonce: format!("0x{}", hex::encode(nonce)),
         head_block: head,
         blocks,
@@ -370,8 +412,9 @@ fn handle_issue(state: &AppState, body: &[u8]) -> (StatusCode, Value) {
             kurier: KurierState::default(),
         },
     );
+    let chain_name = chain_spec(chain_id).map(|c| c.name).unwrap_or("?");
     println!(
-        "[issue] {id}: agent {} threshold {threshold} head {head} blocks {:?} owner {}",
+        "[issue] {id}: agent {} chain {chain_name}({chain_id}) threshold {threshold} head {head} blocks {:?} owner {}",
         challenge.agent_id, challenge.blocks,
         owner.map(|o| format!("0x{}", hex::encode(o))).unwrap_or_else(|| "UNVERIFIED".into())
     );
@@ -404,7 +447,13 @@ async fn handle_submit(state: &Arc<AppState>, id: &str, body: &[u8]) -> (StatusC
     let policy = Policy {
         allow_debug: std::env::var("POR_ALLOW_DEBUG").is_ok(),
         required_threshold: snap.threshold,
-        expected_chain_id: 1,
+        expected_chain_id: snap.challenge.chain_id,
+    };
+    // The attested-header host that vouches for this challenge's chain (the trust anchor that
+    // stops a proof committing chain_id=X while attesting a different chain's RPC).
+    let expected_server = match expected_host(snap.challenge.chain_id) {
+        Ok(h) => h.to_string(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
     let allow_unverified = state.allow_unverified_owner;
     let allow_no_pres = state.allow_no_presentation;
@@ -417,7 +466,7 @@ async fn handle_submit(state: &Arc<AppState>, id: &str, body: &[u8]) -> (StatusC
 
     // Verification (receipt.verify x3 + presentation checks) is CPU-bound: off the runtime.
     let result = tokio::task::spawn_blocking(move || {
-        verify_submission(&snap, &resp, &policy, allow_unverified, allow_no_pres)
+        verify_submission(&snap, &resp, &policy, &expected_server, allow_unverified, allow_no_pres)
     })
     .await
     .unwrap();
@@ -562,21 +611,31 @@ async fn main() {
         .parse()
         .expect("VERIFIER_ADDR must be host:port");
     let window_days: u64 = std::env::var("POR_WINDOW_DAYS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-    let slot_secs: u64 = std::env::var("POR_SLOT_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
-    let window_blocks = window_days * 86400 / slot_secs;
+    // Optional global block-time override; unset -> each chain's own block time is used.
+    let slot_override: Option<u64> = std::env::var("POR_SLOT_SECONDS").ok().and_then(|s| s.parse().ok());
+    let testnet = std::env::var("POR_TESTNET").is_ok();
 
     let state = Arc::new(AppState {
         sessions: Mutex::new(HashMap::new()),
         registry_base: std::env::var("POR_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".into()),
-        window_blocks,
+        window_days,
+        slot_override,
+        testnet,
         allow_unverified_owner: std::env::var("POR_ALLOW_UNVERIFIED_OWNER").is_ok(),
         allow_no_presentation: std::env::var("POR_ALLOW_NO_PRESENTATION").is_ok(),
     });
 
+    // In testnet mode the selectable ids are mainnet selectors that resolve to a testnet.
+    let chains: Vec<String> = selectable_ids(testnet)
+        .into_iter()
+        .filter_map(|id| resolve_chain(id, testnet).ok().map(|s| format!("{id}->{}({})", s.name, s.chain_id)))
+        .collect();
     let listener = TcpListener::bind(addr).await.expect("bind");
     println!(
-        "verifier listening on http://{addr} (registry {}, window {window_blocks} blocks, {} blocks/challenge)",
-        state.registry_base, BLOCK_COUNT
+        "verifier listening on http://{addr} (registry {}, window {window_days}d, {} blocks/challenge, {})\n  chains: {}",
+        state.registry_base, BLOCK_COUNT,
+        if testnet { "TESTNET mode" } else { "mainnet mode" },
+        chains.join(", ")
     );
 
     loop {

@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tiny_keccak::{Hasher, Keccak};
 
+pub mod chains;
+pub use chains::{
+    chain_spec, expected_host, is_supported, resolve_chain, selectable_ids, ChainSpec, CHAINS,
+};
+
 /// Domain-separation tag prepended to the signed challenge bytes.
 pub const CHALLENGE_DOMAIN: &[u8] = b"POR-CHALLENGE-v1\n";
 /// `version` string stamped into a [`Response`].

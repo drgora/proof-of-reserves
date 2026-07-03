@@ -8,9 +8,10 @@
 // Vite dev proxy already consume, but sources identity/ownership straight from
 // Base Sepolia on-chain reads (IdentityRegistry.ownerOf). No MCP, zero deps.
 //
-// Faithful to real testnet state for the part that matters for auth (owner).
-// Receipts are stubbed to 0 for now (accurate until a PoR validation is recorded
-// on-chain); decoding ValidationRegistry is a later extension — see NOTE below.
+// Faithful to real testnet state: owner comes from IdentityRegistry.ownerOf, and
+// receipts are read from on-chain ValidationGateway logs (eth_getLogs, chunked) — so
+// they survive submitter/adapter restarts. The submitter /pipeline is used only for the
+// live in-progress timeline panel (PIPELINE_URL), not as the receipt source.
 //
 // Env:
 //   PORT                  default 8090   — same as server.mjs so it's a drop-in
@@ -20,6 +21,12 @@
 //   POR_PROOF_TYPES       parity with server.mjs (default proof-of-reserves,reserves,por,risc0)
 //   POR_NETWORK           display label (default "Base Sepolia")
 //   ZKVERIFY_EXPLORER / BASESCAN_URL / MARKETPLACE_URL — same defaults as server.mjs
+//   VALIDATION_GATEWAY    default 0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920 (V2 proxy; emits ValidationRecorded)
+//   VALIDATION_EVENT_TOPIC default ValidationRecorded topic0 (agentId+validationId indexed)
+//   RECEIPTS_LOOKBACK_BLOCKS default 50000 — initial on-chain log-scan depth from head (~28h on Base)
+//   RECEIPTS_FROM_BLOCK   optional absolute start block for deep history (overrides lookback)
+//   RECEIPTS_REFRESH_MS   default 20000 — min interval between incremental re-scans
+//   PIPELINE_URL          submitter /pipeline; drives the LIVE timeline panel only (not receipts)
 
 import http from 'node:http'
 
@@ -118,11 +125,10 @@ function decodeAbiString(hex) {
   return bytes.toString('utf8')
 }
 
-// --- receipts from the submitter's recorded validations --------------------
-// The submitter (submitter.mjs) reports each validation it recorded on Base. We
-// read its /pipeline and turn VERIFIED jobs into receipts, keyed by agentId. This
-// is the on-chain truth (real recordValidation tx hashes) surfaced without an
-// event-log decode; a pure ValidationRegistry scan can replace this later.
+// --- live in-progress timeline (submitter /pipeline) -----------------------
+// Optional: the submitter reports jobs still moving through Kurier→aggregate→relay→record.
+// This drives the UI's live timeline panel only; RECEIPTS come from on-chain logs (below),
+// so a dead/absent submitter no longer zeroes the portal.
 let pipelineCache = { at: 0, jobs: [] }
 async function pipelineJobs() {
   if (!PIPELINE_URL) return []
@@ -136,26 +142,141 @@ async function pipelineJobs() {
   }
   return pipelineCache.jobs
 }
-function jobToReceipt(job, i) {
-  return {
-    id: job.validationId != null ? `val-${job.validationId}` : `${job.agentId}-r${i}`,
-    status: 'validated',
-    scorePct: null,
-    proofType: PROOF_TYPE,
-    timestamp: job.updatedAt || job.submittedAt,
-    zkVerify: job.zkVerifyExtrinsicHash
-      ? { txHash: job.zkVerifyExtrinsicHash, blockHash: job.zkVerifyBlockHash, curve: 'risc0-succinct' }
-      : undefined,
-    validationTxHash: job.validationTxHash,
-    validationId: job.validationId,
-    ethBlockHash: job.ethBlockHash ?? null,
+
+// --- receipts from on-chain ValidationGateway logs -------------------------
+// Each ValidationGateway.recordValidation emits ValidationRecorded(agentId indexed,
+// validationId indexed, string proofType, uint256 attestationId, bytes32 leaf,
+// bytes32 fingerprint, bytes32 zkVerifyBlockHash). We eth_getLogs that event and turn
+// each into a receipt, keyed by agentId. This is durable on-chain truth: it survives
+// submitter/adapter restarts (unlike the old ephemeral in-memory /pipeline read).
+// sepolia.base.org caps eth_getLogs at 2000 blocks/query, so the scan is chunked; an
+// incremental cursor keeps refreshes cheap (only new blocks). Deep history (validations
+// older than the initial lookback) needs RECEIPTS_FROM_BLOCK.
+const VALIDATION_GATEWAY = (
+  process.env.VALIDATION_GATEWAY || '0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920'
+).toLowerCase()
+const VALIDATION_TOPIC =
+  process.env.VALIDATION_EVENT_TOPIC ||
+  '0x816e123c9567e2dac73985f152bfbc51fc9b323357a989b8a3851a2194f791c8'
+const GETLOGS_MAX_RANGE = 2000n // sepolia.base.org hard cap
+const RECEIPTS_LOOKBACK = BigInt(process.env.RECEIPTS_LOOKBACK_BLOCKS || 50000) // initial scan depth
+const RECEIPTS_FROM_BLOCK = process.env.RECEIPTS_FROM_BLOCK
+  ? BigInt(process.env.RECEIPTS_FROM_BLOCK)
+  : null
+const RECEIPTS_REFRESH_MS = Number(process.env.RECEIPTS_REFRESH_MS || 20000)
+
+async function rpc(method, params) {
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method, params }),
+  })
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`)
+  const j = await res.json()
+  if (j.error) throw new Error(j.error.message || `${method} failed`)
+  return j.result
+}
+
+const blockTsCache = new Map() // blockNumber(int) -> ISO string
+async function blockTimestamp(blockNumber) {
+  if (blockTsCache.has(blockNumber)) return blockTsCache.get(blockNumber)
+  try {
+    const b = await rpc('eth_getBlockByNumber', ['0x' + blockNumber.toString(16), false])
+    const iso = b?.timestamp ? new Date(parseInt(b.timestamp, 16) * 1000).toISOString() : null
+    blockTsCache.set(blockNumber, iso)
+    return iso
+  } catch {
+    return null
   }
 }
+
+// Decode the event's first (dynamic `string`) param — proofType.
+function decodeEventProofType(data) {
+  try {
+    const body = data.slice(2)
+    const off = Number(BigInt('0x' + body.slice(0, 64))) * 2
+    const len = Number(BigInt('0x' + body.slice(off, off + 64)))
+    if (!len) return null
+    return Buffer.from(body.slice(off + 64, off + 64 + len * 2), 'hex').toString('utf8')
+  } catch {
+    return null
+  }
+}
+
+// agentHex -> Map(validationId -> receipt); cursor makes refreshes incremental.
+const store = { cursor: null, byAgent: new Map(), lastScan: 0, inflight: null }
+const padAgentTopic = (id) => '0x' + BigInt(id).toString(16).padStart(64, '0')
+
+async function scanOnce() {
+  const head = BigInt(await rpc('eth_blockNumber', []))
+  const from =
+    store.cursor != null
+      ? store.cursor + 1n
+      : RECEIPTS_FROM_BLOCK ?? (head > RECEIPTS_LOOKBACK ? head - RECEIPTS_LOOKBACK : 0n)
+  for (let start = from; start <= head; start += GETLOGS_MAX_RANGE) {
+    const end = start + GETLOGS_MAX_RANGE - 1n > head ? head : start + GETLOGS_MAX_RANGE - 1n
+    for (const id of POR_AGENT_IDS) {
+      const logs = await rpc('eth_getLogs', [
+        {
+          address: VALIDATION_GATEWAY,
+          topics: [VALIDATION_TOPIC, padAgentTopic(id)],
+          fromBlock: '0x' + start.toString(16),
+          toBlock: '0x' + end.toString(16),
+        },
+      ])
+      for (const l of logs) {
+        const agentHex = '0x' + BigInt(l.topics[1]).toString(16)
+        const validationId = Number(BigInt(l.topics[2]))
+        let m = store.byAgent.get(agentHex)
+        if (!m) {
+          m = new Map()
+          store.byAgent.set(agentHex, m)
+        }
+        if (m.has(validationId)) continue
+        m.set(validationId, {
+          id: `val-${validationId}`,
+          status: 'validated', // recordValidation only emits on success
+          scorePct: null,
+          proofType: decodeEventProofType(l.data) || PROOF_TYPE,
+          timestamp: null, // resolved lazily from the block
+          blockNumber: parseInt(l.blockNumber, 16),
+          validationTxHash: l.transactionHash,
+          validationId,
+        })
+      }
+    }
+    store.cursor = end
+  }
+}
+
+async function ensureScan() {
+  if (store.cursor != null && Date.now() - store.lastScan < RECEIPTS_REFRESH_MS) return
+  if (store.inflight) return store.inflight
+  store.inflight = scanOnce()
+    .catch((e) => console.error('[adapter] validation scan failed:', e.message))
+    .finally(() => {
+      store.lastScan = Date.now()
+      store.inflight = null
+    })
+  return store.inflight
+}
+
+function agentReceiptCount(agentId) {
+  const m = store.byAgent.get(toHexId(agentId).toLowerCase())
+  return m ? m.size : 0
+}
+
 async function receiptsFor(hexId) {
-  const id = hexId.toLowerCase()
-  const items = (await pipelineJobs())
-    .filter((j) => j.stage === 'VERIFIED' && String(j.agentId).toLowerCase() === id)
-    .map(jobToReceipt)
+  await ensureScan()
+  const m = store.byAgent.get(hexId.toLowerCase())
+  const items = m ? [...m.values()].sort((a, b) => b.blockNumber - a.blockNumber) : []
+  await Promise.all(
+    items
+      .filter((it) => it.timestamp == null)
+      .map(async (it) => {
+        it.timestamp = await blockTimestamp(it.blockNumber)
+      }),
+  )
   return {
     count: items.length,
     validated: items.length,
@@ -241,21 +362,31 @@ const routes = [
     pattern: /^\/api\/overview$/,
     // Shape must match the `Overview` type in api.ts — the Directory reads
     // o.agents.withReceipts and o.receipts.{count,validated} WITHOUT optional
-    // chaining, so these objects must exist. This adapter is not a full-registry
-    // indexer (that's what the MCP was), so the registry-wide tiles are 0: we
-    // only know the allowlisted agents, and receipts aren't decoded yet.
-    handler: async () => ({
-      network: NETWORK,
-      source: 'base-sepolia-onchain',
-      agents: { totalRegistered: 0, withReceipts: 0 },
-      receipts: { count: 0, validated: 0, failed: 0 },
-      proofTypes: { count: 0, types: [] },
-      porProofTypes: POR_PROOF_TYPES,
-      porTypeLive: false, // gateway proof-type list isn't read on-chain here; use allowlist mode
-      explorer: ZKVERIFY_EXPLORER,
-      baseExplorer: BASESCAN_URL,
-      marketplace: MARKETPLACE_URL,
-    }),
+    // chaining, so these objects must exist. This adapter isn't a full-registry
+    // indexer (that's what the MCP was), so the tiles cover only the allowlisted
+    // agents — but receipts are now real, read from on-chain ValidationGateway logs.
+    handler: async () => {
+      await ensureScan()
+      let count = 0
+      let withReceipts = 0
+      for (const id of POR_AGENT_IDS) {
+        const n = agentReceiptCount(id)
+        count += n
+        if (n) withReceipts++
+      }
+      return {
+        network: NETWORK,
+        source: 'base-sepolia-onchain',
+        agents: { totalRegistered: POR_AGENT_IDS.length, withReceipts },
+        receipts: { count, validated: count, failed: 0 },
+        proofTypes: { count: count ? 1 : 0, types: count ? [PROOF_TYPE] : [] },
+        porProofTypes: POR_PROOF_TYPES,
+        porTypeLive: count > 0,
+        explorer: ZKVERIFY_EXPLORER,
+        baseExplorer: BASESCAN_URL,
+        marketplace: MARKETPLACE_URL,
+      }
+    },
   },
   {
     // Proxy the submitter's live pipeline so the UI's timeline panel lights up.
@@ -327,4 +458,12 @@ http
     console.log(`[sepolia-registry] read-proxy on :${PORT} -> ${IDENTITY_REGISTRY} @ ${RPC_URL}`)
     console.log(`[sepolia-registry] network: ${NETWORK}`)
     if (POR_AGENT_IDS.length) console.log(`[sepolia-registry] directory allowlist: ${POR_AGENT_IDS.join(', ')}`)
+    // Warm the on-chain receipt scan so the first page load is instant.
+    ensureScan()
+      .then(() => {
+        let count = 0
+        for (const id of POR_AGENT_IDS) count += agentReceiptCount(id)
+        console.log(`[sepolia-registry] on-chain receipts scanned: ${count} (cursor @ ${store.cursor})`)
+      })
+      .catch(() => {})
   })

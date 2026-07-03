@@ -19,8 +19,8 @@
 //   BASE_SEPOLIA_RPC_URL  default https://sepolia.base.org
 //   KURIER_API_KEY        required to submit
 //   KURIER_API_URL        default https://api-testnet.kurier.xyz
-//   KURIER_SUBMIT_PATH    default /submit-proof   (repo/verify.rs scheme; skill uses /api/v1/submit-proof)
-//   KURIER_STATUS_PATH    default /job-status
+//   KURIER_SUBMIT_PATH    default /api/v1/submit-proof   (real Kurier scheme; matches verify.rs)
+//   KURIER_STATUS_PATH    default /api/v1/job-status
 //   POR_PROOF_TYPE        default proof-of-reserves   (the gateway proofType label you registered)
 //   POR_CTX_HASH          default keccak256("risc0")  (must equal the ctxHash you registered)
 //   POR_VERSION_HASH      optional; if set, skip the search and use this bytes32
@@ -44,8 +44,8 @@ import { baseSepolia } from 'viem/chains'
 const RPC_URL = process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org'
 const KURIER_API_URL = process.env.KURIER_API_URL || 'https://api-testnet.kurier.xyz'
 const KURIER_API_KEY = process.env.KURIER_API_KEY || ''
-const KURIER_SUBMIT_PATH = process.env.KURIER_SUBMIT_PATH || '/submit-proof'
-const KURIER_STATUS_PATH = process.env.KURIER_STATUS_PATH || '/job-status'
+const KURIER_SUBMIT_PATH = process.env.KURIER_SUBMIT_PATH || '/api/v1/submit-proof'
+const KURIER_STATUS_PATH = process.env.KURIER_STATUS_PATH || '/api/v1/job-status'
 const PROOF_TYPE = process.env.POR_PROOF_TYPE || 'proof-of-reserves'
 const CTX_HASH = process.env.POR_CTX_HASH || keccak256(toBytes('risc0'))
 const FORCED_VERSION_HASH = process.env.POR_VERSION_HASH || null
@@ -56,19 +56,17 @@ const GATEWAY = (process.env.GATEWAY || '0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33
 const ATTESTATION = (process.env.ATTESTATION || '0x0807C544D38aE7729f8798388d89Be6502A1e8A8')
 const PORT = Number(process.env.SUBMITTER_PORT || 8092)
 
-// risc0 versionHash candidates. zkVerify's statement uses VERSION_HASH = keccak256("risc0_"+version);
-// the exact version string for V3_0 is confirmed at runtime by matching Kurier's leaf.
+// risc0 versionHash candidates. zkVerify's statement uses VERSION_HASH = sha256("risc0:v<M>.<N>")
+// — SHA-256 (not keccak), colon format (not underscores). The Risc0Version enum is V2_1/V2_2/V2_3/V3_0,
+// so V<M>_<N> maps to "risc0:v<M>.<N>"; our proofOptions.version is V3_0 -> "risc0:v3.0". The others are
+// kept as fallbacks and the exact string is confirmed at runtime by matching Kurier's leaf.
 const VERSION_HASH_CANDIDATES = [
-  ['risc0_V3_0', keccak256(toBytes('risc0_V3_0'))],
-  ['risc0_v3.0', keccak256(toBytes('risc0_v3.0'))],
-  ['risc0_3.0.0', keccak256(toBytes('risc0_3.0.0'))],
-  ['risc0_3.0', keccak256(toBytes('risc0_3.0'))],
-  ['risc0_v3.0.0', keccak256(toBytes('risc0_v3.0.0'))],
-  ['risc0_V3.0', keccak256(toBytes('risc0_V3.0'))],
-  ['V3_0', keccak256(toBytes('V3_0'))],
-  ['3.0.0', keccak256(toBytes('3.0.0'))],
+  ['risc0:v3.0', sha256(toBytes('risc0:v3.0'))],
+  ['risc0:v3.0.0', sha256(toBytes('risc0:v3.0.0'))],
+  ['risc0:v2.3', sha256(toBytes('risc0:v2.3'))],
+  ['risc0:v2.2', sha256(toBytes('risc0:v2.2'))],
+  ['risc0:v2.1', sha256(toBytes('risc0:v2.1'))],
   ['sha256("")', sha256('0x')],
-  ['zero', '0x' + '0'.repeat(64)],
 ]
 
 const gatewayAbi = [
@@ -122,6 +120,17 @@ function upsert(jobId, patch) {
   return jobs.get(jobId)
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Serialize on-chain sends across concurrently-running bundles. All bundles share ONE wallet,
+// so simultaneous writeContract calls grab the same nonce and all but one fail with
+// "replacement transaction underpriced". withTxLock chains the simulate→write→wait section so
+// each tx mines (nonce advances on the node) before the next bundle sends.
+let txChain = Promise.resolve()
+function withTxLock(fn) {
+  const result = txChain.then(fn, fn) // run regardless of the previous send's outcome
+  txChain = result.then(() => {}, () => {}) // keep the chain alive past failures
+  return result
+}
 
 // --- Kurier -----------------------------------------------------------------
 async function kurierSubmit(bundle) {
@@ -251,12 +260,16 @@ async function runPipeline(bundle, meta = {}) {
       versionHash: resolved.versionHash,
     }
     // simulate first: validates on-chain (surfaces reverts) AND returns validationId — no gas.
-    const { request, result: validationId } = await publicClient.simulateContract({
-      account, address: GATEWAY, abi: gatewayAbi, functionName: 'recordValidation', args: [p], value: fee,
+    // The send is serialized (withTxLock) so parallel bundles don't collide on the wallet nonce.
+    const { txHash, validationId } = await withTxLock(async () => {
+      const { request, result: vId } = await publicClient.simulateContract({
+        account, address: GATEWAY, abi: gatewayAbi, functionName: 'recordValidation', args: [p], value: fee,
+      })
+      const tx = await walletClient.writeContract(request)
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: tx })
+      if (receipt.status !== 'success') throw new Error(`recordValidation reverted (tx ${tx})`)
+      return { txHash: tx, validationId: vId }
     })
-    const txHash = await walletClient.writeContract(request)
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash })
-    if (receipt.status !== 'success') throw new Error(`recordValidation reverted (tx ${txHash})`)
     upsert(jobId, {
       stage: 'VERIFIED', validationTxHash: txHash,
       validationId: validationId != null ? Number(validationId) : undefined,

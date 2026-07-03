@@ -45,7 +45,7 @@ stand-in that plays **two roles** in one process:
 1. **Registry read MCP** — the `tools/call` slice the proxy uses, served from
    mutable state (seeded with two PoR agents + two non-PoR agents).
 2. **Kurier stand-in** — the exact endpoints `por_verify` hits
-   (`POST /submit-proof/:key`, `GET /job-status/:key/:jobId`), so the **real
+   (`POST /api/v1/submit-proof/:key`, `GET /api/v1/job-status/:key/:jobId`), so the **real
    `por_verify` binary submits its real receipt here with no code changes**.
 
 The bridge: when a submitted receipt reaches `Aggregated`, the mock **auto-records

@@ -6,8 +6,9 @@
 //      get_agent, get_registry_overview, get_validation_stats, list_proof_types),
 //      served from MUTABLE state at POST /api/mcp.
 //   2. Kurier stand-in    — the exact endpoints por_verify hits
-//      (POST /submit-proof/:key, GET /job-status/:key/:jobId), so the REAL
-//      por_verify binary submits its REAL receipt here with no code changes.
+//      (POST /api/v1/submit-proof/:key, GET /api/v1/job-status/:key/:jobId; the
+//      /api/v1 prefix is optional), so the REAL por_verify binary submits its
+//      REAL receipt here with no code changes.
 //
 // The bridge: when a submitted receipt reaches "Aggregated", the mock AUTO-RECORDS
 // a validation on the prover's agent — which then shows up in the directory UI.
@@ -443,7 +444,7 @@ function handleRpc(msg) {
 // Kurier stand-in (write side) — matches por_verify's exact paths + fields
 // ---------------------------------------------------------------------------
 
-/** POST /submit-proof/:key — accept a receipt, open a job. */
+/** POST /api/v1/submit-proof/:key — accept a receipt, open a job. */
 function kurierSubmit(body) {
   if (body?.proofType !== 'risc0' || !body?.proofData?.proof) {
     // No jobId in the response → por_verify treats it as a rejection (exit 3).
@@ -465,7 +466,7 @@ function kurierSubmit(body) {
   return { status: 200, body: { jobId, optimisticVerify: 'Verified' } }
 }
 
-/** GET /job-status/:key/:jobId — advance the job; auto-record on "Aggregated". */
+/** GET /api/v1/job-status/:key/:jobId — advance the job; auto-record on "Aggregated". */
 function kurierStatus(jobId) {
   const job = state.jobs.get(jobId)
   if (!job) return { status: 200, body: { status: 'Failed', error: `unknown job ${jobId}` } }
@@ -618,6 +619,8 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
   const p = url.pathname
   const seg = p.split('/').filter(Boolean)
+  // Kurier clients prefix endpoints with /api/v1 (the real Kurier scheme); accept with or without.
+  const kseg = seg[0] === 'api' && seg[1] === 'v1' ? seg.slice(2) : seg
 
   // --- health ---
   if (req.method === 'GET' && p === '/health') {
@@ -631,16 +634,16 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, handleRpc(msg))
   }
 
-  // --- Kurier stand-in (por_verify): POST /submit-proof/:key ---
-  if (req.method === 'POST' && seg[0] === 'submit-proof') {
+  // --- Kurier stand-in (por_verify): POST /api/v1/submit-proof/:key ---
+  if (req.method === 'POST' && kseg[0] === 'submit-proof') {
     const body = await readBody(req)
     if (body === null) return json(res, 400, { error: 'parse error' })
     const r = kurierSubmit(body)
     return json(res, r.status, r.body)
   }
-  // --- Kurier stand-in: GET /job-status/:key/:jobId ---
-  if (req.method === 'GET' && seg[0] === 'job-status' && seg.length >= 3) {
-    const r = kurierStatus(seg.slice(2).join('/'))
+  // --- Kurier stand-in: GET /api/v1/job-status/:key/:jobId ---
+  if (req.method === 'GET' && kseg[0] === 'job-status' && kseg.length >= 3) {
+    const r = kurierStatus(kseg.slice(2).join('/'))
     return json(res, r.status, r.body)
   }
 
@@ -693,7 +696,7 @@ server.listen(PORT, () => {
   const base = `http://127.0.0.1:${PORT}`
   console.log(`[mock-registry] up on :${PORT} (registry MCP + Kurier + control), risc0 live: ${POR_LIVE}`)
   console.log(`[mock-registry]   registry MCP : POST ${base}/api/mcp   (point server.mjs here)`)
-  console.log(`[mock-registry]   kurier       : POST ${base}/submit-proof/:key  ·  GET ${base}/job-status/:key/:jobId`)
+  console.log(`[mock-registry]   kurier       : POST ${base}/api/v1/submit-proof/:key  ·  GET ${base}/api/v1/job-status/:key/:jobId`)
   console.log(`[mock-registry]   pipeline     : GET ${base}/mock/pipeline   (point PIPELINE_URL here)`)
   console.log(`[mock-registry]   control      : GET ${base}/mock/state  ·  POST ${base}/mock/{reset,target,agent,record}`)
   console.log(`[mock-registry]   self agent   : ${SELF_ID} ("${SELF_NAME}") — unverified until its first proof lands`)

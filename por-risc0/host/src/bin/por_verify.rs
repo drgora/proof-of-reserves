@@ -24,10 +24,19 @@ fn main() {
         hex::encode(j.block_hash), j.threshold, j.chain_id, j.debug
     );
 
+    // The attested-host trust anchor + fetch endpoint for the chain the journal CLAIMS.
+    // An unsupported chain_id can't be bound to any RPC host -> reject.
+    let expected_server = por_types::expected_host(j.chain_id).unwrap_or_else(|e| {
+        eprintln!("[3] REJECTED: {e} (journal claims a chain with no known attesting RPC)");
+        std::process::exit(2);
+    });
+    // Dev-only refetch is debug_getRawHeader -> the header endpoint.
+    let rpc_url = verify::header_rpc_url(j.chain_id).expect("rpc url");
+
     // ---- BINDING: prefer the TLSNotary presentation; dev fallback re-fetches by hash ----
     match bundle.get("tlsnPresentation").and_then(|v| v.as_str()) {
         Some(b64) => {
-            let att = verify::verify_presentation(b64).expect("PRESENTATION INVALID");
+            let att = verify::verify_presentation(b64, expected_server).expect("PRESENTATION INVALID");
             verify::bind_block_hash(&att.header_rlp, &j.block_hash).expect("BINDING FAILED");
             println!(
                 "[3] TLSNotary OK: notary 0x{} attests {} served the header (t={}); \
@@ -36,12 +45,12 @@ fn main() {
             );
         }
         None => {
-            let header = verify::raw_header(&format!("0x{}", hex::encode(j.block_hash)));
+            let header = verify::raw_header(&format!("0x{}", hex::encode(j.block_hash)), &rpc_url);
             verify::bind_block_hash(&header, &j.block_hash).expect("BINDING FAILED");
-            let mismatch = verify::keccak256(&verify::raw_header("finalized")) != j.block_hash;
+            let mismatch = verify::keccak256(&verify::raw_header("finalized", &rpc_url)) != j.block_hash;
             println!(
-                "[3] (DEV, no TLSNotary presentation) re-fetched header by hash; keccak == journal \
-                 block_hash; negative control (finalized != journal): {mismatch}"
+                "[3] (DEV, no TLSNotary presentation) re-fetched header by hash from {expected_server}; \
+                 keccak == journal block_hash; negative control (finalized != journal): {mismatch}"
             );
         }
     }

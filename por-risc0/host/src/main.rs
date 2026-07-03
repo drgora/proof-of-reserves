@@ -29,21 +29,36 @@ use alloy_primitives::keccak256;
 use k256::ecdsa::SigningKey;
 use base64::Engine as _;
 
-use host::attest;
-use por_types::{Challenge, Response, RESPONSE_VERSION};
+use host::{attest, verify};
+use por_types::{chain_spec, resolve_chain, Challenge, Response, RESPONSE_VERSION};
 
-const RPC_URL: &str = "https://eth.drpc.org";
-const ADDR: &str = "0x00000000219ab540356cBB839Cbe05303d7705Fa"; // beacon deposit contract
+const ADDR: &str = "0x00000000219ab540356cBB839Cbe05303d7705Fa"; // beacon deposit contract (mainnet DEMO)
 
-fn rpc(method: &str, params: Value) -> Value {
+fn rpc(method: &str, params: Value, rpc_url: &str) -> Value {
     let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
-    let out = Command::new("curl")
-        .args(["-s", "-X", "POST", "-H", "content-type: application/json",
-               "-H", "accept-encoding: identity", "-H", "user-agent: por/0.1",
-               "--data", &body, RPC_URL])
-        .output().expect("curl");
-    let resp: Value = serde_json::from_slice(&out.stdout).expect("json");
-    resp.get("result").cloned().expect("result")
+    // Public/free-tier RPCs (esp. L2 endpoints) return transient errors -- rate limits (code
+    // 15/30), routing hiccups (code 19). Retry with linear backoff before giving up.
+    let mut last = String::new();
+    for attempt in 0u64..6 {
+        let out = Command::new("curl")
+            .args(["-s", "-m", "30", "-X", "POST", "-H", "content-type: application/json",
+                   "-H", "accept-encoding: identity", "-H", "user-agent: por/0.1",
+                   "--data", &body, rpc_url])
+            .output().expect("curl");
+        match serde_json::from_slice::<Value>(&out.stdout) {
+            Ok(resp) => {
+                if let Some(r) = resp.get("result") {
+                    return r.clone();
+                }
+                last = resp.get("error").map(|e| e.to_string())
+                    .unwrap_or_else(|| String::from_utf8_lossy(&out.stdout).to_string());
+            }
+            Err(_) => last = String::from_utf8_lossy(&out.stdout).to_string(),
+        }
+        eprintln!("    rpc {method} attempt {} failed ({last}); retrying ...", attempt + 1);
+        std::thread::sleep(std::time::Duration::from_millis(1000 * (attempt + 1)));
+    }
+    panic!("no result from {rpc_url} for {method} after retries: {last}");
 }
 
 fn hexb(s: &str) -> Vec<u8> {
@@ -92,9 +107,12 @@ struct BlockInputs {
 }
 
 // Fetch the raw header + account proof for `addr_hex` at `block_hex` (a hex block number).
-fn fetch_block(block_hex: &str, addr_hex: &str) -> BlockInputs {
-    let header_rlp = hexb(rpc("debug_getRawHeader", serde_json::json!([block_hex])).as_str().unwrap());
-    let proof = rpc("eth_getProof", serde_json::json!([addr_hex, Vec::<String>::new(), block_hex]));
+// The header (debug_getRawHeader, needs no state) comes from `header_url` (the canonical drpc
+// host that the attestation also uses); the account proof (eth_getProof, needs ARCHIVE state
+// for the multi-day window) comes from `proof_url`, which may be a different archive endpoint.
+fn fetch_block(block_hex: &str, addr_hex: &str, header_url: &str, proof_url: &str) -> BlockInputs {
+    let header_rlp = hexb(rpc("debug_getRawHeader", serde_json::json!([block_hex]), header_url).as_str().unwrap());
+    let proof = rpc("eth_getProof", serde_json::json!([addr_hex, Vec::<String>::new(), block_hex]), proof_url);
     let nonce = u64::from_str_radix(proof["nonce"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
     let balance = hu128(proof["balance"].as_str().unwrap());
     let storage_hash = h32(proof["storageHash"].as_str().unwrap());
@@ -218,11 +236,12 @@ fn prove_block(
 }
 
 // MPC-TLS-attest the header via the notary (before the slow prove, so failures surface fast).
-async fn maybe_attest(block_hex: &str) -> Option<String> {
+// `rpc_host` is the chain's attested server name -- the verifier binds it to the chain_id.
+async fn maybe_attest(block_hex: &str, rpc_host: &str) -> Option<String> {
     match std::env::var("NOTARY_ADDR") {
         Ok(addr) => {
-            println!("    attesting debug_getRawHeader({block_hex}) via notary {addr} ...");
-            let bytes = attest::attest_header(&addr, "eth.drpc.org", block_hex)
+            println!("    attesting debug_getRawHeader({block_hex}) via notary {addr} -> {rpc_host} ...");
+            let bytes = attest::attest_header(&addr, rpc_host, block_hex)
                 .await
                 .expect("TLSNotary attestation failed");
             println!("    attestation OK: {} byte presentation", bytes.len());
@@ -285,54 +304,71 @@ async fn main() {
             let a: [u8; 20] = keccak256(&enc.as_bytes()[1..65])[12..32].try_into().unwrap();
             format!("0x{}", hex::encode(a))
         }
-        None => ADDR.to_string(),
+        // DEMO (no key): a funded contract to prove against. Default is the mainnet beacon
+        // deposit contract; override per chain with POR_DEMO_ADDR (the default holds nothing
+        // off mainnet, so the guest would correctly refuse the threshold there).
+        None => std::env::var("POR_DEMO_ADDR").unwrap_or_else(|_| ADDR.to_string()),
     };
     let debug = owner_key.is_none();
-    let chain_id: u32 = 1;
+    // Which chain to prove on. In challenge/connected modes the verifier's challenge is
+    // authoritative (ch.chain_id -- and the verifier applies POR_TESTNET when it resolves the
+    // selector we send). This is the connected request's SELECTOR and the legacy chain. Default 1.
+    let req_chain_id: u32 = arg_value("--chain-id")
+        .or_else(|| std::env::var("POR_CHAIN_ID").ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    // Legacy mode picks its own chain (no verifier), so it honors POR_TESTNET here.
+    let testnet = std::env::var("POR_TESTNET").is_ok();
     let seg_po2: u32 = std::env::var("POR_SEGMENT_PO2").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
 
     match connected_target() {
         // Connected: request challenge -> prove -> submit -> verdict, against a live verifier.
+        // We send the raw selector; the verifier (its POR_TESTNET) resolves it to the effective chain.
         Some((url, agent_id, threshold)) => {
-            run_connected(url, agent_id, threshold, &owner_key, &addr_hex, debug, chain_id, seg_po2).await
+            run_connected(url, agent_id, threshold, req_chain_id, &owner_key, &addr_hex, debug, seg_po2).await
         }
         None => match load_challenge() {
             // File: prove a challenge from --challenge/POR_CHALLENGE -> response.json.
-            Some(ch) => run_challenge(ch, &owner_key, &addr_hex, debug, chain_id, seg_po2).await,
+            Some(ch) => run_challenge(ch, &owner_key, &addr_hex, debug, seg_po2).await,
             // Legacy: single finalized block -> proof.json.
-            None => run_legacy_single(&owner_key, &addr_hex, debug, chain_id, seg_po2).await,
+            None => run_legacy_single(req_chain_id, testnet, &owner_key, &addr_hex, debug, seg_po2).await,
         },
     }
 }
 
-// Prove every challenged block + sign the challenge -> the Response to submit.
+// Prove every challenged block + sign the challenge -> the Response to submit. The chain is
+// the verifier's (ch.chain_id) -- the prover proves whatever chain the challenge pinned.
 async fn prove_challenge(
     ch: Challenge,
     owner_key: &Option<SigningKey>,
     addr_hex: &str,
     debug: bool,
-    chain_id: u32,
     seg_po2: u32,
 ) -> Response {
-    assert_eq!(ch.chain_id, chain_id, "challenge chain_id != 1");
+    let chain_id = ch.chain_id;
+    let spec = chain_spec(chain_id)
+        .unwrap_or_else(|| panic!("challenge names unsupported chain_id {chain_id}"));
+    let header_url = verify::header_rpc_url(chain_id).expect("header rpc url");
+    let proof_url = verify::proof_rpc_url(chain_id).expect("proof rpc url");
     let threshold = ch.threshold_u128().expect("challenge threshold");
     let challenge_nonce = ch.nonce_bytes().expect("challenge nonce");
     let agent_id = ch.agent_id_hash();
     let mode = if debug { "DEMO (debug=true)" } else { "OWNERSHIP (debug=false)" };
     println!(
-        "challenge {}: agent {}, threshold {} ETH, blocks {:?}, mode {mode}, wallet {addr_hex}",
-        ch.challenge_id, ch.agent_id, threshold as f64 / 1e18, ch.blocks
+        "challenge {}: agent {}, chain {}({chain_id}), threshold {} (native), blocks {:?}, mode {mode}, wallet {addr_hex}",
+        ch.challenge_id, ch.agent_id, spec.name, threshold as f64 / 1e18, ch.blocks
     );
+    println!("  header <- {header_url}   proof <- {proof_url}");
 
     let mut bundles = Vec::with_capacity(ch.blocks.len());
     let t_all = Instant::now();
     for (i, &blk) in ch.blocks.iter().enumerate() {
         let block_hex = format!("0x{blk:x}");
         println!("[block {}/{}] {block_hex} (#{blk})", i + 1, ch.blocks.len());
-        let inputs = fetch_block(&block_hex, addr_hex);
+        let inputs = fetch_block(&block_hex, addr_hex, &header_url, &proof_url);
         ensure_can_prove(inputs.balance, threshold, debug);
         let sig = wallet_sig(&inputs.header_rlp, owner_key);
-        let presentation = maybe_attest(&block_hex).await;
+        let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
         let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
         bundles.push(bundle);
     }
@@ -352,10 +388,9 @@ async fn run_challenge(
     owner_key: &Option<SigningKey>,
     addr_hex: &str,
     debug: bool,
-    chain_id: u32,
     seg_po2: u32,
 ) {
-    let response = prove_challenge(ch, owner_key, addr_hex, debug, chain_id, seg_po2).await;
+    let response = prove_challenge(ch, owner_key, addr_hex, debug, seg_po2).await;
     let out = arg_value("--out").unwrap_or_else(|| "response.json".into());
     File::create(&out).unwrap()
         .write_all(serde_json::to_string_pretty(&response).unwrap().as_bytes()).unwrap();
@@ -368,15 +403,15 @@ async fn run_connected(
     verifier_url: String,
     agent_id: String,
     threshold: String,
+    req_chain_id: u32,
     owner_key: &Option<SigningKey>,
     addr_hex: &str,
     debug: bool,
-    chain_id: u32,
     seg_po2: u32,
 ) {
     let base = verifier_url.trim_end_matches('/').to_string();
-    println!("requesting challenge from {base} for agent {agent_id} (threshold {threshold} wei) ...");
-    let req = serde_json::json!({ "agent_id": agent_id, "threshold": threshold }).to_string();
+    println!("requesting challenge from {base} for agent {agent_id} (chain {req_chain_id}, threshold {threshold} wei) ...");
+    let req = serde_json::json!({ "agent_id": agent_id, "threshold": threshold, "chain_id": req_chain_id }).to_string();
     let raw = http_post_json(&format!("{base}/v1/challenges"), &req);
     if raw.get("challenge_id").is_none() {
         eprintln!("verifier did not issue a challenge: {raw}");
@@ -385,7 +420,7 @@ async fn run_connected(
     let ch: Challenge = serde_json::from_value(raw).expect("parse challenge from verifier");
     let cid = ch.challenge_id.clone();
 
-    let response = prove_challenge(ch, owner_key, addr_hex, debug, chain_id, seg_po2).await;
+    let response = prove_challenge(ch, owner_key, addr_hex, debug, seg_po2).await;
     if let Some(out) = arg_value("--out") {
         File::create(&out).unwrap()
             .write_all(serde_json::to_string_pretty(&response).unwrap().as_bytes()).unwrap();
@@ -411,23 +446,31 @@ async fn run_connected(
 
 // Legacy mode: single finalized block -> proof.json (placeholder challenge fields).
 async fn run_legacy_single(
+    selector: u32,
+    testnet: bool,
     owner_key: &Option<SigningKey>,
     addr_hex: &str,
     debug: bool,
-    chain_id: u32,
     seg_po2: u32,
 ) {
-    let fin = rpc("eth_getBlockByNumber", serde_json::json!(["finalized", false]));
+    // Resolve the selector under POR_TESTNET (mainnet id -> its paired testnet); the effective
+    // real chain_id is what gets fetched, attested, and committed.
+    let spec = resolve_chain(selector, testnet).unwrap_or_else(|e| panic!("{e}"));
+    let chain_id = spec.chain_id;
+    let header_url = verify::header_rpc_url(chain_id).expect("header rpc url");
+    let proof_url = verify::proof_rpc_url(chain_id).expect("proof rpc url");
+    // Finalized head is a cheap recent query -> the header endpoint.
+    let fin = rpc("eth_getBlockByNumber", serde_json::json!(["finalized", false]), &header_url);
     let block_hex = fin["number"].as_str().unwrap().to_string();
     let block_num = u64::from_str_radix(block_hex.trim_start_matches("0x"), 16).unwrap();
     let threshold: u128 = std::env::var("POR_THRESHOLD").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(1_000_000_000_000_000_000); // 1 ETH
 
-    let inputs = fetch_block(&block_hex, addr_hex);
+    let inputs = fetch_block(&block_hex, addr_hex, &header_url, &proof_url);
     let mode = if debug { "DEMO (debug=true, ownership skipped)" } else { "OWNERSHIP (debug=false)" };
     println!(
-        "legacy single-block mode: {mode}\naddress {addr_hex}, block {block_num}, depth {}, balance {} ETH, threshold {} ETH",
-        inputs.account_proof.len(), inputs.balance as f64 / 1e18, threshold as f64 / 1e18
+        "legacy single-block mode: {mode}\nchain {}({chain_id}), address {addr_hex}, block {block_num}, depth {}, balance {} (native), threshold {}",
+        spec.name, inputs.account_proof.len(), inputs.balance as f64 / 1e18, threshold as f64 / 1e18
     );
     ensure_can_prove(inputs.balance, threshold, debug);
 
@@ -435,7 +478,7 @@ async fn run_legacy_single(
     // No challenge in legacy mode -> placeholder journal labels.
     let challenge_nonce = [0u8; 32];
     let agent_id: [u8; 32] = keccak256(b"por-demo-agent").into();
-    let presentation = maybe_attest(&block_hex).await;
+    let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
     let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
 
     File::create("proof.json").unwrap()

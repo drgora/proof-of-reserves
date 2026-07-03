@@ -26,10 +26,42 @@ use tlsn::{
     verifier::ServerCertVerifier,
 };
 
+/// Mainnet RPC, the default for the dev-only by-hash header refetch. Per-chain endpoints
+/// come from [`header_rpc_url`] / [`proof_rpc_url`]; the attested-host trust anchor is
+/// `ChainSpec::rpc_host`.
 pub const RPC_URL: &str = "https://eth.drpc.org";
-/// The RPC the notary must have witnessed (the cert identifies the operator, not the
-/// chain -- chain identity rests on this allowlist + the pinned block).
-pub const EXPECTED_SERVER: &str = "eth.drpc.org";
+
+/// The endpoint that serves the block HEADER (`debug_getRawHeader`) and cheap head queries
+/// (`eth_getBlockByNumber`). Defaults to the chain's canonical `rpc_host` (`https://{host}`):
+/// a full node there serves `debug_getRawHeader` at ANY depth (headers are never pruned, only
+/// state), and it is the same host the TLSNotary presentation attests, so the guest's header
+/// is byte-identical to the attested one. Override: `POR_HEADER_RPC_URL_<chain_id>`.
+pub fn header_rpc_url(chain_id: u32) -> Result<String> {
+    if let Ok(u) = std::env::var(format!("POR_HEADER_RPC_URL_{chain_id}")) {
+        return Ok(u);
+    }
+    Ok(format!(
+        "https://{}",
+        por_types::chain_spec(chain_id)
+            .ok_or_else(|| anyhow!("unsupported chain_id {chain_id}"))?
+            .rpc_host
+    ))
+}
+
+/// The endpoint that serves the ACCOUNT PROOF (`eth_getProof`). Unlike the header, this needs
+/// ARCHIVE state for the multi-day challenge window (pruned free nodes only hold ~128 recent
+/// blocks), so it is separate and points at an archive-capable RPC (need not be drpc, need not
+/// serve `debug_`). Override: `POR_RPC_URL_<chain_id>`. NOT a trust anchor -- the proof is
+/// self-verifying against the header's state_root in-circuit, so the endpoint can't forge it.
+pub fn proof_rpc_url(chain_id: u32) -> Result<String> {
+    if let Ok(u) = std::env::var(format!("POR_RPC_URL_{chain_id}")) {
+        return Ok(u);
+    }
+    Ok(por_types::chain_spec(chain_id)
+        .ok_or_else(|| anyhow!("unsupported chain_id {chain_id}"))?
+        .rpc_url
+        .to_string())
+}
 
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut k = Keccak::v256();
@@ -134,7 +166,12 @@ pub struct AttestedHeader {
 /// Verify a TLSNotary presentation: notary signature + Mozilla cert chain + Host allowlist,
 /// then recover the header RLP from the revealed response. Does NOT bind to a block hash --
 /// call [`bind_block_hash`] with the caller's expected hash.
-pub fn verify_presentation(b64: &str) -> Result<AttestedHeader> {
+///
+/// `expected_server` is the DNS name the attestation must have witnessed -- the caller derives
+/// it from the claimed chain's [`ChainSpec::rpc_host`] (via [`por_types::expected_host`]), which
+/// is what binds `journal.chain_id` to reality: a presentation served by the wrong chain's RPC
+/// is rejected here, so an agent cannot commit `chain_id = 1` while attesting a testnet header.
+pub fn verify_presentation(b64: &str, expected_server: &str) -> Result<AttestedHeader> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .context("decode tlsnPresentation base64")?;
@@ -158,9 +195,9 @@ pub fn verify_presentation(b64: &str) -> Result<AttestedHeader> {
 
     let server_name = server_name.ok_or_else(|| anyhow!("server name not disclosed"))?;
     let ServerName::Dns(ref dns) = server_name;
-    if dns.as_str() != EXPECTED_SERVER {
+    if dns.as_str() != expected_server {
         bail!(
-            "unexpected server {} (Host allowlist requires {EXPECTED_SERVER})",
+            "unexpected server {} (chain-host binding requires {expected_server})",
             dns.as_str()
         );
     }
@@ -222,15 +259,16 @@ pub fn recover_address_from_prehash(prehash: &[u8; 32], sig65: &[u8]) -> Result<
     Ok(a)
 }
 
-/// Dev-only fallback: re-fetch a raw header by block tag/hash over plain TLS (no notary).
-pub fn raw_header(block: &str) -> Vec<u8> {
+/// Dev-only fallback: re-fetch a raw header by block tag/hash over plain TLS (no notary),
+/// from `rpc_url` (the claimed chain's endpoint; mainnet [`RPC_URL`] by default).
+pub fn raw_header(block: &str, rpc_url: &str) -> Vec<u8> {
     let body = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"debug_getRawHeader\",\"params\":[\"{block}\"]}}"
     );
     let out = Command::new("curl")
         .args([
             "-s", "-X", "POST", "-H", "content-type: application/json", "-H",
-            "accept-encoding: identity", "-H", "user-agent: por/0.1", "--data", &body, RPC_URL,
+            "accept-encoding: identity", "-H", "user-agent: por/0.1", "--data", &body, rpc_url,
         ])
         .output()
         .expect("curl");
@@ -257,7 +295,8 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Build a policy from the standard env knobs (`POR_ALLOW_DEBUG`, `POR_REQUIRED_THRESHOLD`).
+    /// Build a policy from the standard env knobs (`POR_ALLOW_DEBUG`, `POR_REQUIRED_THRESHOLD`,
+    /// `POR_EXPECTED_CHAIN_ID` -- which chain the relying party requires, default mainnet).
     pub fn from_env() -> Self {
         Self {
             allow_debug: std::env::var("POR_ALLOW_DEBUG").is_ok(),
@@ -265,7 +304,10 @@ impl Policy {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1_000_000_000_000_000_000),
-            expected_chain_id: 1,
+            expected_chain_id: std::env::var("POR_EXPECTED_CHAIN_ID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
         }
     }
 }
@@ -340,7 +382,7 @@ pub fn submit_to_kurier(bundle: &Value) -> Result<Option<KurierOutcome>> {
         }
     }
 
-    let submit_url = format!("{base}/submit-proof/{api_key}");
+    let submit_url = format!("{base}/api/v1/submit-proof/{api_key}");
     let out = curl_post_json(&submit_url, &payload.to_string());
     let resp: Value = serde_json::from_slice(&out)
         .map_err(|_| anyhow!("Kurier response was not JSON: {}", String::from_utf8_lossy(&out)))?;
@@ -349,7 +391,7 @@ pub fn submit_to_kurier(bundle: &Value) -> Result<Option<KurierOutcome>> {
     };
     let job_id = job_id.to_string();
 
-    let status_url = format!("{base}/job-status/{api_key}/{job_id}");
+    let status_url = format!("{base}/api/v1/job-status/{api_key}/{job_id}");
     for _ in 0..120 {
         std::thread::sleep(Duration::from_secs(5));
         let s = curl(&["-s", &status_url]);
