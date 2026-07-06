@@ -14,9 +14,8 @@
 //   REGISTRY_MCP_URL     default https://agent-registry.horizenlabs.io/api/mcp
 //   POR_PROOF_TYPES      comma list, default "proof-of-reserves,reserves,por,risc0"
 //                        — a verified agent counts as PoR if any of its receipts/
-//                          proof-types match one of these (case-insensitive).
-//   POR_AGENT_IDS        comma list of agentIds — if set, the directory is exactly
-//                        these agents (skips the proof-type scan; cheap + deterministic).
+//                          proof-types match one of these (case-insensitive). Any
+//                          agent with ≥1 matching receipt is listed.
 //   POR_SHOW_ALL         "1" (default) — when no PoR agent is found, fall back to
 //                        listing all verified agents (so the UI isn't blank before
 //                        PoR is registered). Set "0" to strictly show only PoR.
@@ -38,10 +37,6 @@ const REGISTRY_MCP_URL =
 const POR_PROOF_TYPES = (process.env.POR_PROOF_TYPES || 'proof-of-reserves,reserves,por,risc0')
   .split(',')
   .map((s) => s.trim().toLowerCase())
-  .filter(Boolean)
-const POR_AGENT_IDS = (process.env.POR_AGENT_IDS || '')
-  .split(',')
-  .map((s) => s.trim())
   .filter(Boolean)
 const POR_SHOW_ALL = (process.env.POR_SHOW_ALL ?? '1') !== '0'
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 60_000)
@@ -230,23 +225,15 @@ async function getOverview() {
 }
 
 /**
- * The verified PoR directory.
+ * The verified PoR directory: every agent with ≥1 PoR-typed receipt.
  * Returns { mode, agents, totalVerified, porCount }.
- *   mode = 'allowlist' | 'por' | 'fallback-all'
+ *   mode = 'por' | 'fallback-all'
  */
 async function getDirectory() {
   return cached('directory', DIRECTORY_TTL_MS, async () => {
-    // 1) Explicit allowlist — cheapest + deterministic. Use this in production
-    //    once you know your PoR agent ids (POR_AGENT_IDS): no scan needed.
-    if (POR_AGENT_IDS.length) {
-      const details = await mapLimit(POR_AGENT_IDS, 4, (id) => getAgentDetail(id).catch(() => null))
-      const agents = details.filter(Boolean).map(detailToRow)
-      return { mode: 'allowlist', agents, totalVerified: agents.length, porCount: agents.length }
-    }
-
     const verified = await fetchAllVerified()
 
-    // 2) If no PoR proof type is registered on the marketplace yet, no agent can
+    // 1) If no PoR proof type is registered on the marketplace yet, no agent can
     //    possibly hold a PoR receipt — so skip the expensive per-agent scan
     //    (one get_agent per verified agent) entirely and fall back immediately.
     let porTypeLive = false
@@ -261,8 +248,8 @@ async function getDirectory() {
         : { mode: 'por', agents: [], totalVerified: verified.length, porCount: 0 }
     }
 
-    // 3) PoR type is live — enrich each verified agent and keep those whose
-    //    receipts use a PoR proof type. (Prefer POR_AGENT_IDS to avoid this.)
+    // 2) PoR type is live — enrich each verified agent and keep those whose
+    //    receipts use a PoR proof type (i.e. submitted ≥1 PoR proof).
     const details = await mapLimit(verified, 4, (a) => getAgentDetail(a.agentId).catch(() => null))
     const por = []
     verified.forEach((row, i) => {
@@ -342,7 +329,6 @@ const routes = [
       marketplace: MARKETPLACE_URL,
       pipeline: PIPELINE_URL ? PIPELINE_URL : false,
       porProofTypes: POR_PROOF_TYPES,
-      porAgentIds: POR_AGENT_IDS,
       showAllFallback: POR_SHOW_ALL,
     }),
   },
@@ -421,6 +407,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`[por-registry] read-proxy on :${PORT} -> ${REGISTRY_MCP_URL}`)
   console.log(`[por-registry] PoR proof types: ${POR_PROOF_TYPES.join(', ')}`)
-  if (POR_AGENT_IDS.length) console.log(`[por-registry] PoR allowlist: ${POR_AGENT_IDS.join(', ')}`)
   console.log(`[por-registry] fallback-to-all-verified: ${POR_SHOW_ALL}`)
 })

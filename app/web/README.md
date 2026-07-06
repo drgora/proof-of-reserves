@@ -108,8 +108,7 @@ API, keeping the directory read-only by default.
 
 | Want | Do |
 |------|----|
-| `por` mode | default — overview advertises `risc0`, proxy runs the scan, keeps the PoR agents. |
-| `allowlist` mode | `POR_AGENT_IDS=0x1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d,0x9f8e7d6c5b4a3928176554433221100ffeeddccb npm run server:mock`. |
+| `por` mode | default — overview advertises `risc0`, proxy runs the scan, keeps every agent with a PoR receipt. |
 | `fallback-all` / preview banner | start the mock with `MOCK_POR_LIVE=0 npm run mock`. |
 | 404 path | `GET /api/agents/0xnope` → 404. |
 
@@ -121,16 +120,17 @@ Mock env: `MOCK_PORT` (default `8091`), `MOCK_POR_LIVE` (default `1`),
 
 ## Configuring the Proof-of-Reserves filter
 
-The directory shows only agents that have proven **Proof-of-Reserves**. Until a PoR
-proof type + PoR agents exist on the marketplace it runs in **preview mode**
-(shows all verified agents, with a banner). Configure the read-proxy via env:
+The directory lists **every agent that has submitted at least one Proof-of-Reserves
+proof** — discovered from the registry/on-chain validation records, not from a
+configured allowlist. Until a PoR proof type + PoR agents exist on the marketplace it
+runs in **preview mode** (shows all verified agents, with a banner). Configure the
+read-proxy via env:
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `PORT` | `8090` | Port the read-proxy listens on (must match the Vite proxy target). |
 | `REGISTRY_MCP_URL` | `https://agent-registry.horizenlabs.io/api/mcp` | Registry MCP endpoint. |
-| `POR_AGENT_IDS` | _(unset)_ | Comma list of agent ids — **the production path**: directory = exactly these agents, no scan. Set this once you've registered your PoR agents. |
-| `POR_PROOF_TYPES` | `proof-of-reserves,reserves,por,risc0` | An agent counts as PoR if any receipt uses one of these proof types (case-insensitive). Set this to the exact `proofType` string you register PoR under. |
+| `POR_PROOF_TYPES` | `proof-of-reserves,reserves,por,risc0` | An agent is listed if any receipt uses one of these proof types (case-insensitive). Set this to the exact `proofType` string(s) you register PoR under. |
 | `POR_SHOW_ALL` | `1` | When no PoR agent is found, fall back to listing all verified agents. Set `0` to strictly show only PoR (empty until PoR exists). |
 | `ZKVERIFY_EXPLORER` | `https://zkverify-testnet.subscan.io` | Base URL for per-receipt `…/extrinsic/{txHash}` (zkVerify) links. |
 | `BASESCAN_URL` | `https://sepolia.basescan.org` | Base Sepolia explorer — on-chain `recordValidation` tx + contract/owner address links. |
@@ -139,10 +139,12 @@ proof type + PoR agents exist on the marketplace it runs in **preview mode**
 | `PIPELINE_URL` | _(unset)_ | If set, `/api/pipeline` proxies this submitter status source so the UI can show a live submission timeline. Unset → pipeline disabled. Locally point it at the mock's `/mock/pipeline`. |
 | `CACHE_TTL_MS` / `DIRECTORY_TTL_MS` | `60000` / `300000` | Cache TTLs for cheap endpoints / the verified-agent scan. |
 
-Once you register PoR on the marketplace, the simplest wiring is:
+Once you register PoR on the marketplace, no per-agent configuration is needed — set
+`POR_PROOF_TYPES` to the `proofType` string(s) you register PoR under and every agent
+that has submitted such a proof is listed automatically:
 
 ```bash
-POR_AGENT_IDS=0xabc123,0xdef456 npm run server
+POR_PROOF_TYPES=proof-of-reserves,risc0 npm run server
 ```
 
 If `POR_PROOF_TYPES` doesn't yet match a live marketplace proof type, the proxy
@@ -155,6 +157,6 @@ skips the (expensive) per-agent scan entirely and serves preview mode.
 | `GET /api/health` | proxy config (registry url, PoR filter settings). |
 | `GET /api/overview` | registry totals + `porTypeLive`. |
 | `GET /api/proof-types` | proof types accepted by the validation gateway. |
-| `GET /api/agents` | `{ mode, agents[], totalVerified, porCount, network, marketplace, baseExplorer }` — `mode` is `allowlist`/`por`/`fallback-all`. |
+| `GET /api/agents` | `{ mode, agents[], totalVerified, porCount, network, marketplace, baseExplorer }` — `mode` is `por`/`fallback-all`. |
 | `GET /api/agents/:agentId` | full agent profile: identity, what-it-proves, receipts (with zkVerify extrinsic + on-chain `recordValidation` tx), SLA, reputation, network + explorer/marketplace bases. |
 | `GET /api/pipeline` | `{ enabled, jobs[] }` — live submission timeline (SUBMITTED→FINALIZED→AGGREGATED→RELAYING→RECORDING→VERIFIED). `enabled:false` unless `PIPELINE_URL` is set. |

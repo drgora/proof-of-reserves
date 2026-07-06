@@ -183,8 +183,8 @@ function FallbackNotice({ porTypeLive }: { porTypeLive?: boolean }) {
           ? 'No agent has recorded a Proof-of-Reserves validation yet.'
           : 'Proof-of-Reserves isn’t a registered proof type on the marketplace yet.'}{' '}
         Once PoR agents record validations, this directory automatically filters to them. (Set{' '}
-        <span className="mono">POR_AGENT_IDS</span> or <span className="mono">POR_PROOF_TYPES</span>{' '}
-        on the read-proxy to pin the filter.)
+        <span className="mono">POR_PROOF_TYPES</span> on the read-proxy to match the proof type
+        you register PoR under.)
       </div>
     </div>
   )

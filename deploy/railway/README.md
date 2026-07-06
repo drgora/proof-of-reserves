@@ -163,9 +163,11 @@ the two Rust services also set their bind address explicitly.
 ### `adapter`
 ```
 PORT=8090
-POR_AGENT_IDS=0x16ec                       # your marketplace agent id(s), comma-separated
 PIPELINE_URL=http://submitter.railway.internal:8092/pipeline
+# The directory is discovered from on-chain ValidationGateway logs — every agent
+# that recorded ≥1 PoR-typed proof is listed, no agent allowlist to configure.
 # optional overrides (defaults target Base Sepolia):
+# POR_PROOF_TYPES=proof-of-reserves,reserves,por,risc0   # which proofType(s) count as PoR
 # BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
 # IDENTITY_REGISTRY=0x8004A818BFB912233c491871b3d84c89A494BD9e
 # VALIDATION_GATEWAY=0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920

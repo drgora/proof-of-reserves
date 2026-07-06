@@ -13,12 +13,16 @@
 // they survive submitter/adapter restarts. The submitter /pipeline is used only for the
 // live in-progress timeline panel (PIPELINE_URL), not as the receipt source.
 //
+// The directory is discovered, not configured: the log scan reads EVERY
+// ValidationRecorded event on the gateway (agentId is an indexed topic) and lists
+// every agent that recorded at least one PoR-typed proof — no agent allowlist.
+//
 // Env:
 //   PORT                  default 8090   — same as server.mjs so it's a drop-in
 //   BASE_SEPOLIA_RPC_URL  default https://sepolia.base.org
 //   IDENTITY_REGISTRY     default 0x8004A818BFB912233c491871b3d84c89A494BD9e (ERC-721 AgentCards)
-//   POR_AGENT_IDS         comma list of agent ids (hex 0x16ec or decimal 5868) shown in the directory
 //   POR_PROOF_TYPES       parity with server.mjs (default proof-of-reserves,reserves,por,risc0)
+//                         — an agent is listed if any recorded validation's proofType matches
 //   POR_NETWORK           display label (default "Base Sepolia")
 //   ZKVERIFY_EXPLORER / BASESCAN_URL / MARKETPLACE_URL — same defaults as server.mjs
 //   VALIDATION_GATEWAY    default 0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920 (V2 proxy; emits ValidationRecorded)
@@ -34,10 +38,6 @@ const PORT = Number(process.env.PORT || 8090)
 const RPC_URL = process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org'
 const IDENTITY_REGISTRY =
   process.env.IDENTITY_REGISTRY || '0x8004A818BFB912233c491871b3d84c89A494BD9e'
-const POR_AGENT_IDS = (process.env.POR_AGENT_IDS || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
 const POR_PROOF_TYPES = (process.env.POR_PROOF_TYPES || 'proof-of-reserves,reserves,por,risc0')
   .split(',')
   .map((s) => s.trim().toLowerCase())
@@ -314,8 +314,10 @@ async function resolvePublicInputs(item) {
 }
 
 // agentHex -> Map(validationId -> receipt); cursor makes refreshes incremental.
+// Every key is an agent discovered from the logs, so it has ≥1 PoR receipt by construction.
 const store = { cursor: null, byAgent: new Map(), lastScan: 0, inflight: null }
-const padAgentTopic = (id) => '0x' + BigInt(id).toString(16).padStart(64, '0')
+/** Agents that have recorded ≥1 PoR proof (the whole directory). Requires a scan first. */
+const discoveredAgentIds = () => [...store.byAgent.keys()]
 
 async function scanOnce() {
   const head = BigInt(await rpc('eth_blockNumber', []))
@@ -325,35 +327,39 @@ async function scanOnce() {
       : RECEIPTS_FROM_BLOCK ?? (head > RECEIPTS_LOOKBACK ? head - RECEIPTS_LOOKBACK : 0n)
   for (let start = from; start <= head; start += GETLOGS_MAX_RANGE) {
     const end = start + GETLOGS_MAX_RANGE - 1n > head ? head : start + GETLOGS_MAX_RANGE - 1n
-    for (const id of POR_AGENT_IDS) {
-      const logs = await rpc('eth_getLogs', [
-        {
-          address: VALIDATION_GATEWAY,
-          topics: [VALIDATION_TOPIC, padAgentTopic(id)],
-          fromBlock: '0x' + start.toString(16),
-          toBlock: '0x' + end.toString(16),
-        },
-      ])
-      for (const l of logs) {
-        const agentHex = '0x' + BigInt(l.topics[1]).toString(16)
-        const validationId = Number(BigInt(l.topics[2]))
-        let m = store.byAgent.get(agentHex)
-        if (!m) {
-          m = new Map()
-          store.byAgent.set(agentHex, m)
-        }
-        if (m.has(validationId)) continue
-        m.set(validationId, {
-          id: `val-${validationId}`,
-          status: 'validated', // recordValidation only emits on success
-          scorePct: null,
-          proofType: decodeEventProofType(l.data) || PROOF_TYPE,
-          timestamp: null, // resolved lazily from the block
-          blockNumber: parseInt(l.blockNumber, 16),
-          validationTxHash: l.transactionHash,
-          validationId,
-        })
+    // Scan EVERY ValidationRecorded log (no agentId topic filter) so we discover every
+    // agent that recorded a validation, then keep those whose proofType is PoR. This is
+    // "list any agent that submitted ≥1 PoR proof" straight from on-chain truth.
+    const logs = await rpc('eth_getLogs', [
+      {
+        address: VALIDATION_GATEWAY,
+        topics: [VALIDATION_TOPIC],
+        fromBlock: '0x' + start.toString(16),
+        toBlock: '0x' + end.toString(16),
+      },
+    ])
+    for (const l of logs) {
+      const proofType = decodeEventProofType(l.data)
+      // Keep PoR-typed proofs (unknown proofType falls back to PROOF_TYPE, a PoR type).
+      if (proofType && !POR_PROOF_TYPES.includes(proofType.toLowerCase())) continue
+      const agentHex = '0x' + BigInt(l.topics[1]).toString(16)
+      const validationId = Number(BigInt(l.topics[2]))
+      let m = store.byAgent.get(agentHex)
+      if (!m) {
+        m = new Map()
+        store.byAgent.set(agentHex, m)
       }
+      if (m.has(validationId)) continue
+      m.set(validationId, {
+        id: `val-${validationId}`,
+        status: 'validated', // recordValidation only emits on success
+        scorePct: null,
+        proofType: proofType || PROOF_TYPE,
+        timestamp: null, // resolved lazily from the block
+        blockNumber: parseInt(l.blockNumber, 16),
+        validationTxHash: l.transactionHash,
+        validationId,
+      })
     }
     store.cursor = end
   }
@@ -495,7 +501,6 @@ const routes = [
       baseExplorer: BASESCAN_URL,
       marketplace: MARKETPLACE_URL,
       porProofTypes: POR_PROOF_TYPES,
-      porAgentIds: POR_AGENT_IDS,
     }),
   },
   {
@@ -503,21 +508,18 @@ const routes = [
     // Shape must match the `Overview` type in api.ts — the Directory reads
     // o.agents.withReceipts and o.receipts.{count,validated} WITHOUT optional
     // chaining, so these objects must exist. This adapter isn't a full-registry
-    // indexer (that's what the MCP was), so the tiles cover only the allowlisted
-    // agents — but receipts are now real, read from on-chain ValidationGateway logs.
+    // indexer (that's what the MCP was), so the tiles cover the agents discovered
+    // from on-chain ValidationGateway logs (every agent with ≥1 PoR receipt).
     handler: async () => {
       await ensureScan()
+      const ids = discoveredAgentIds()
       let count = 0
-      let withReceipts = 0
-      for (const id of POR_AGENT_IDS) {
-        const n = agentReceiptCount(id)
-        count += n
-        if (n) withReceipts++
-      }
+      for (const id of ids) count += agentReceiptCount(id)
       return {
         network: NETWORK,
         source: 'base-sepolia-onchain',
-        agents: { totalRegistered: POR_AGENT_IDS.length, withReceipts },
+        // Every discovered agent has ≥1 receipt by construction, so withReceipts == count of agents.
+        agents: { totalRegistered: ids.length, withReceipts: ids.length },
         receipts: { count, validated: count, failed: 0 },
         proofTypes: { count: count ? 1 : 0, types: count ? [PROOF_TYPE] : [] },
         porProofTypes: POR_PROOF_TYPES,
@@ -539,12 +541,13 @@ const routes = [
   {
     pattern: /^\/api\/agents$/,
     handler: async () => {
+      await ensureScan()
       const details = await Promise.all(
-        POR_AGENT_IDS.map((id) => getAgentDetail(id).catch(() => null)),
+        discoveredAgentIds().map((id) => getAgentDetail(id).catch(() => null)),
       )
       const agents = details.filter(Boolean).map(detailToRow)
       return {
-        mode: 'allowlist',
+        mode: 'por',
         agents,
         totalVerified: agents.length,
         porCount: agents.length,
@@ -597,13 +600,15 @@ http
   .listen(PORT, () => {
     console.log(`[sepolia-registry] read-proxy on :${PORT} -> ${IDENTITY_REGISTRY} @ ${RPC_URL}`)
     console.log(`[sepolia-registry] network: ${NETWORK}`)
-    if (POR_AGENT_IDS.length) console.log(`[sepolia-registry] directory allowlist: ${POR_AGENT_IDS.join(', ')}`)
+    console.log(`[sepolia-registry] PoR proof types: ${POR_PROOF_TYPES.join(', ')}`)
     // Warm the on-chain receipt scan so the first page load is instant.
     ensureScan()
       .then(() => {
         let count = 0
-        for (const id of POR_AGENT_IDS) count += agentReceiptCount(id)
-        console.log(`[sepolia-registry] on-chain receipts scanned: ${count} (cursor @ ${store.cursor})`)
+        for (const m of store.byAgent.values()) count += m.size
+        console.log(
+          `[sepolia-registry] on-chain receipts scanned: ${count} across ${store.byAgent.size} agent(s) (cursor @ ${store.cursor})`,
+        )
       })
       .catch(() => {})
   })

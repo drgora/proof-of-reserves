@@ -22,7 +22,7 @@ export type AgentRow = {
   proofTypes?: string[]
 }
 
-export type DirectoryMode = 'allowlist' | 'por' | 'fallback-all'
+export type DirectoryMode = 'por' | 'fallback-all'
 
 export type Directory = {
   mode: DirectoryMode

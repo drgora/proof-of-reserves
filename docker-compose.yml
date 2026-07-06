@@ -8,8 +8,9 @@
 #   web       — Vite frontend; its /api is proxied to readproxy:8090.
 #
 # No API key required to browse (it reads the public marketplace registry).
-# To filter the directory to your Proof-of-Reserves agents, set POR_AGENT_IDS
-# (and/or POR_PROOF_TYPES) in the environment / a .env file before `up`.
+# The directory lists every agent that submitted a Proof-of-Reserves proof; set
+# POR_PROOF_TYPES in the environment / a .env file to match the proofType you
+# register PoR under (any agent with a matching receipt is listed automatically).
 #
 # NOTE: the PoR proving/verifying stack (por-risc0 prover, TLSNotary notary,
 # por_verify, Kurier→zkVerify settlement) is a separate concern and is NOT part
@@ -27,7 +28,6 @@ services:
       REGISTRY_MCP_URL: ${REGISTRY_MCP_URL:-https://agent-registry.horizenlabs.io/api/mcp}
       # PoR filter — see app/web/README.md. Defaults leave it in "preview mode"
       # (all verified agents) until a PoR proof type / PoR agents exist.
-      POR_AGENT_IDS: ${POR_AGENT_IDS:-}
       POR_PROOF_TYPES: ${POR_PROOF_TYPES:-proof-of-reserves,reserves,por,risc0}
       POR_SHOW_ALL: ${POR_SHOW_ALL:-1}
       ZKVERIFY_EXPLORER: ${ZKVERIFY_EXPLORER:-https://zkverify-testnet.subscan.io}
