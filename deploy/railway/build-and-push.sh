@@ -18,7 +18,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-IMAGE="${RISC0_RUNTIME_IMAGE:-ghcr.io/horizenlabs/por-risc0-runtime:latest}"
+# Publish under a PERSONAL GHCR namespace: the org (horizenlabs) blocks public
+# packages, and Railway pulls the image anonymously at build time. Personal
+# accounts allow public packages. Override the whole ref with RISC0_RUNTIME_IMAGE,
+# or just the owner with GHCR_OWNER. NOTE: `docker login ghcr.io -u <GHCR_OWNER>`
+# with a PAT that has write:packages on that account.
+GHCR_OWNER="${GHCR_OWNER:-drgora}"
+IMAGE="${RISC0_RUNTIME_IMAGE:-ghcr.io/${GHCR_OWNER}/por-risc0-runtime:latest}"
 
 if [ "${SKIP_BUILD:-0}" != 1 ]; then
   echo ">> building por-risc0 notary + verifier (RISC0_USE_DOCKER=1 for a deterministic guest image_id)"

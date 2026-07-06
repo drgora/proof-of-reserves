@@ -5,8 +5,8 @@
 # only pulls the result (see Dockerfile.risc0). Build it with build-and-push.sh, or:
 #
 #   cp ../../por-risc0/target/release/{notary,verifier} bin/
-#   docker build -f Dockerfile.runtime -t ghcr.io/horizenlabs/por-risc0-runtime:latest .
-#   docker push ghcr.io/horizenlabs/por-risc0-runtime:latest
+#   docker build -f Dockerfile.runtime -t ghcr.io/drgora/por-risc0-runtime:latest .
+#   docker push ghcr.io/drgora/por-risc0-runtime:latest
 #
 # Base = Debian *trixie* (glibc 2.41) to match the host these binaries are built on
 # (Arch, glibc ~2.41). Bookworm (glibc 2.36) is too old and the binaries won't load.

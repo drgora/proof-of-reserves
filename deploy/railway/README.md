@@ -58,23 +58,25 @@ config — it's optional.
 
 ## FIRST (do this before deploying notary/verifier): build & push the runtime image
 
-The `notary`/`verifier` Dockerfiles are just `FROM ghcr.io/horizenlabs/por-risc0-runtime`.
+The `notary`/`verifier` Dockerfiles are just `FROM ghcr.io/drgora/por-risc0-runtime`.
 **That image must exist and be pullable by Railway, or those two builds fail at the
-`FROM`** (`failed to pull` / `unauthorized`). Build + push it first:
+`FROM`** (`403 Forbidden` / `failed to pull`). It's published to a **personal** GHCR
+namespace on purpose: the `horizenlabs` org blocks public packages, and Railway pulls
+anonymously at build time. Build + push it first:
 
 ```bash
-docker login ghcr.io                       # GitHub PAT with write:packages
+docker login ghcr.io -u drgora             # PAT with write:packages on your account
 deploy/railway/build-and-push.sh           # builds guest reproducibly, pushes image
 ```
 
-Then in GitHub, make the GHCR package **public** (Packages → the package → Settings →
-Change visibility), or add **private-registry credentials** in Railway. Verify from
-another machine: `docker pull ghcr.io/horizenlabs/por-risc0-runtime:latest`.
+Then in GitHub, make the GHCR package **public** (your profile → Packages →
+`por-risc0-runtime` → Package settings → Change visibility → Public — personal
+accounts allow this; the org does not). Verify anonymously from another machine:
+`docker logout ghcr.io && docker pull ghcr.io/drgora/por-risc0-runtime:latest`.
 
-- Push to a path you control and update the `FROM` line in
-  `deploy/railway/{notary,verifier}/Dockerfile` (default
-  `ghcr.io/horizenlabs/por-risc0-runtime:latest`), or set `RISC0_RUNTIME_IMAGE` for
-  the script.
+- To publish under a different account, set `GHCR_OWNER` (or the full
+  `RISC0_RUNTIME_IMAGE`) for the script **and** update the `FROM` line in
+  `deploy/railway/{notary,verifier}/Dockerfile` to match.
 - **Re-run this and redeploy `notary`+`verifier` whenever the guest changes** — a
   verifier built from a different guest rejects every real proof (image_id mismatch).
   See the note in `build-and-push.sh`.
