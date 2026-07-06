@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+#
+# Railway build for the `notary` and `verifier` services. This is near-instant: it
+# just pulls the prebuilt runtime image (built + pushed via build-and-push.sh) and
+# lets each service's startCommand pick `notary` or `verifier`. No Rust toolchain,
+# no Risc0/tlsn compile on Railway — and the verifier's guest image_id stays
+# byte-identical to the prover's (both come from the same RISC0_USE_DOCKER build).
+#
+# IMPORTANT:
+#   - Replace the image ref below if your GHCR path differs.
+#   - Make the GHCR package PUBLIC, or add Railway private-registry credentials,
+#     so Railway can pull it.
+#   - After pushing a new runtime image, redeploy both services to pull it.
+FROM ghcr.io/horizenlabs/por-risc0-runtime:latest
+WORKDIR /data
