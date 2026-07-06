@@ -1,0 +1,30 @@
+{
+  "name": "por-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "server": "node server.mjs",
+    "mock": "node mock-registry.mjs",
+    "server:mock": "REGISTRY_MCP_URL=http://127.0.0.1:8091/api/mcp PIPELINE_URL=http://127.0.0.1:8091/mock/pipeline POR_PROOF_TYPES=proof-of-reserves,risc0 CACHE_TTL_MS=3000 DIRECTORY_TTL_MS=3000 node server.mjs",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.59.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.4",
+    "siwe": "^2.3.2",
+    "viem": "^2.21.0",
+    "wagmi": "^2.14.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  }
+}

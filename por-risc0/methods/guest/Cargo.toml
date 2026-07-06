@@ -1,0 +1,23 @@
+[package]
+name = "por_guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+# 'unstable' enables accelerated precompiles (k256) and the keccak coprocessor.
+risc0-zkvm = { version = "^3.0.4", default-features = false, features = ['std', 'unstable'] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+alloy-primitives = { version = "0.8", default-features = false, features = ["std"] }
+alloy-trie = { version = "0.7", default-features = false, features = ["ethereum"] }
+alloy-rlp = { version = "0.3", default-features = false }
+
+# Accelerated crypto via the risc0 precompile forks:
+#  - k256 (secp256k1 ECDSA) needs the risc0 crypto-bigint fork (elliptic_curve::bigint::risc0)
+#  - tiny-keccak fork routes keccak to the keccak coprocessor; alloy-primitives/alloy-trie
+#    use tiny-keccak as their backend, so all MPT/header keccak is accelerated transparently.
+[patch.crates-io]
+k256 = { git = "https://github.com/risc0/RustCrypto-elliptic-curves", tag = "k256/v0.13.4-risczero.1" }
+crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", tag = "v0.5.5-risczero.0" }
+tiny-keccak = { git = "https://github.com/risc0/tiny-keccak", tag = "tiny-keccak/v2.0.2-risczero.0" }

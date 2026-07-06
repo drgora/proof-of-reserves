@@ -1,0 +1,8 @@
+# Keep the build context small. NB: only the crate target dirs are excluded —
+# por-zk/noir/target/noir.json must stay (it's include_str!'d at build time).
+/por-zk/target
+**/node_modules
+**/dist
+.git
+*.tlsn
+*-signing-key.bin

@@ -1,0 +1,20 @@
+# Rust build output
+/por-zk/target
+
+# Noir build intermediates — but KEEP the compiled circuit (included via include_str!)
+/por-zk/noir/target/*
+!/por-zk/noir/target/noir.json
+
+# Frontend
+/app/web/node_modules
+/app/web/dist
+
+# Generated proof-of-reserves run artifacts
+*.tlsn
+*-signing-key.bin
+por.bundle.json
+
+# Railway: prebuilt binaries staged for the GHCR runtime image (never committed)
+/deploy/railway/bin/
+
+.DS_Store
