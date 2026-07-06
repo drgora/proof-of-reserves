@@ -4,7 +4,7 @@
     "builder": "DOCKERFILE"
   },
   "deploy": {
-    "startCommand": "VERIFIER_ADDR=[::]:${PORT:-7100} exec verifier",
+    "startCommand": "/usr/local/bin/verifier",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
     "numReplicas": 1

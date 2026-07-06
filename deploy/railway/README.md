@@ -45,14 +45,18 @@ proving) and connects *in* to the public `verifier` (HTTP) and `notary` (raw TCP
 Services talk to each other over Railway's **private network** at
 `<service-name>.railway.internal`. Name the services exactly `adapter`,
 `submitter`, `notary`, `verifier`, `ui` so the hostnames below resolve. Private
-networking is IPv6 — the Node services bind `::` by default (fine) and the Rust
-services are told to bind `[::]` in their start commands.
+networking is IPv6 — the Node services bind `::` by default (fine), and the Rust
+services are told to bind `[::]` via the `NOTARY_ADDR` / `VERIFIER_ADDR` variables
+(see Variables).
 
-The two private services (`adapter`, `submitter`) pin a fixed `PORT` (8090 / 8092)
-so (a) peers can address them at `<svc>.railway.internal:<port>` and (b) Railway's
-healthcheck and port-detection target the same port the app listens on. If a
-healthcheck ever blocks a deploy, remove `healthcheckPath` from that service's
-config — it's optional.
+**Every service pins a fixed `PORT`** (notary 7150, verifier 7100, adapter 8090,
+submitter 8092, ui 5173) rather than relying on Railway's injected `$PORT`. This is
+deliberate: **Railway does not run the start command through a shell** — it splits it
+on whitespace and execs the first token — so `$PORT` can't be expanded in a start
+command, and env-assignment prefixes like `NOTARY_ADDR=… cmd` don't work either.
+Fixed ports keep the binding, the peer address, and Railway's port-routing all in
+agreement without any shell. If a healthcheck ever blocks a deploy, remove
+`healthcheckPath` from that service's config — it's optional.
 
 ---
 
@@ -103,7 +107,8 @@ The binaries are staged to `deploy/railway/bin/` (git-ignored) and never committ
    or `submitter.json` / `ui.json`). This sets the start command + healthcheck.
    *Alternative:* leave config empty and set a **Custom Start Command** in the
    dashboard instead (`node sepolia-registry.mjs` / `node submitter.mjs` /
-   `npm run dev -- --host 0.0.0.0 --port $PORT`).
+   `npm run dev -- --host 0.0.0.0 --port 5173`). Use a literal port, not `$PORT` —
+   Railway does not evaluate the start command in a shell.
 4. Set **Variables** + Networking (below).
 
 > Why subdirs for the Rust services: with Root Directory pointing at a folder that
@@ -117,11 +122,12 @@ The binaries are staged to `deploy/railway/bin/` (git-ignored) and never committ
 ## Networking
 
 - **`ui`** — add a **public domain** (Settings → Networking → Generate Domain).
-  Railway routes it to the vite server on `$PORT`.
-- **`verifier`** — add a **public domain**. This is the URL agents pass as
-  `--verifier https://<verifier-domain>`.
-- **`notary`** — add a **TCP Proxy** (Settings → Networking → TCP Proxy). Railway
-  gives you `<host>.proxy.rlwy.net:<port>`. Agents pass this as
+  When Railway asks for the target port, use **5173** (the vite port). The public URL
+  is still plain `https://<domain>` on 443 — Railway's edge maps it to that port.
+- **`verifier`** — add a **public domain**; target port **7100**. This is the URL
+  agents pass as `--verifier https://<verifier-domain>`.
+- **`notary`** — add a **TCP Proxy** (Settings → Networking → TCP Proxy) with target
+  port **7150**. Railway gives you `<host>.proxy.rlwy.net:<port>`. Agents pass this as
   `NOTARY_ADDR=<host>.proxy.rlwy.net:<port>`. (The notary speaks raw TLSNotary
   MPC-TLS, not HTTP, so it needs a TCP proxy — a normal HTTP domain won't work.)
 - **`adapter`**, **`submitter`** — **no public networking**; reached only over the
@@ -144,9 +150,9 @@ identity on every boot.
 
 ## Variables
 
-Secrets (🔒) go in Railway variables, never in the repo. `$PORT` is injected by
-Railway for the public services; the private services pin their port so peers can
-address them.
+Secrets (🔒) go in Railway variables, never in the repo. Every service pins a fixed
+`PORT` (start commands can't expand `$PORT` — Railway runs them without a shell), and
+the two Rust services also set their bind address explicitly.
 
 ### `adapter`
 ```
@@ -176,12 +182,15 @@ KURIER_API_KEY=...           🔒            # testnet Kurier key
 
 ### `notary`
 ```
-# NOTARY_ADDR is set from $PORT by the start command — nothing to add.
-# (Attach the /data volume; see above.)
+PORT=7150
+NOTARY_ADDR=[::]:7150       # REQUIRED — the binary defaults to 127.0.0.1 (unreachable)
+# (Also attach the /data volume; see above.)
 ```
 
 ### `verifier`  (production mode — no dev/allow flags)
 ```
+PORT=7100
+VERIFIER_ADDR=[::]:7100     # REQUIRED — the binary defaults to 127.0.0.1 (unreachable)
 POR_REGISTRY_URL=http://adapter.railway.internal:8090
 POR_SUBMITTER_URL=http://submitter.railway.internal:8092
 # optional:
@@ -196,6 +205,7 @@ POR_SUBMITTER_URL=http://submitter.railway.internal:8092
 
 ### `ui`
 ```
+PORT=5173
 API_PROXY=http://adapter.railway.internal:8090
 ```
 
