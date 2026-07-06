@@ -55,8 +55,14 @@ deliberate: **Railway does not run the start command through a shell** — it sp
 on whitespace and execs the first token — so `$PORT` can't be expanded in a start
 command, and env-assignment prefixes like `NOTARY_ADDR=… cmd` don't work either.
 Fixed ports keep the binding, the peer address, and Railway's port-routing all in
-agreement without any shell. If a healthcheck ever blocks a deploy, remove
-`healthcheckPath` from that service's config — it's optional.
+agreement without any shell.
+
+**No HTTP healthchecks.** The private services (`adapter`, `submitter`) deliberately
+have no `healthcheckPath`. Railway probes a healthcheck on the `PORT` it injects, but
+`submitter.mjs` listens on `SUBMITTER_PORT` (not `PORT`) — a probe on the wrong port
+fails forever ("service unavailable → never became healthy"). Without a healthcheck,
+Railway just needs the container to stay running, which is the right bar for an
+internal service. The restart policy still recovers a crash.
 
 ---
 
@@ -168,8 +174,7 @@ PIPELINE_URL=http://submitter.railway.internal:8092/pipeline
 
 ### `submitter`
 ```
-PORT=8092                                  # aligns Railway's healthcheck/port-detect
-SUBMITTER_PORT=8092                        # the port the app actually reads
+SUBMITTER_PORT=8092                        # the port the app binds (peers use :8092)
 PRIVATE_KEY=0x...            🔒            # Base Sepolia wallet (gas + protocol fee)
 KURIER_API_KEY=...           🔒            # testnet Kurier key
 # optional (defaults shown in submitter.mjs):
