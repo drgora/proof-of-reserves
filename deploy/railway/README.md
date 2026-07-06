@@ -212,7 +212,12 @@ POR_SUBMITTER_URL=http://submitter.railway.internal:8092
 ```
 PORT=5173
 API_PROXY=http://adapter.railway.internal:8090
+# ALLOWED_HOSTS defaults to `.up.railway.app` (covers the generated domain). Set it
+# (comma-separated) when you attach a custom domain, or `true` to disable the check.
 ```
+> Vite's dev server rejects Host headers it doesn't recognise. The default in
+> `vite.config.ts` already allows Railway's `*.up.railway.app` domain; localhost/IPs
+> are always allowed, so local dev and docker-compose are unaffected.
 
 ---
 
