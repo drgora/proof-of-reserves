@@ -1,15 +1,22 @@
 # Railway deployment
 
 Deploys the Proof-of-Reserves stack as **5 Railway services** in one project, all
-from this repo:
+from this repo. The **Root Directory** is the one setting that makes each service
+build the right thing (see "Create the services" — do not skip it):
 
-| Service     | Process                          | Config file       | Root dir      | Exposure                     |
-|-------------|----------------------------------|-------------------|---------------|------------------------------|
-| `adapter`   | `node sepolia-registry.mjs`      | `adapter.json`    | `app/web`     | private (internal only)      |
-| `submitter` | `node submitter.mjs`             | `submitter.json`  | `app/web`     | private (internal only)      |
-| `notary`    | `notary` (Rust, raw TCP)         | `notary.json`     | `deploy/railway` | **public TCP proxy**      |
-| `verifier`  | `verifier` (Rust, HTTP)          | `verifier.json`   | `deploy/railway` | **public HTTPS domain**   |
-| `ui`        | `vite` dev server                | `ui.json`         | `app/web`     | **public HTTPS domain**      |
+| Service     | Process                     | Root Directory (set this)  | Config-as-code path            | Exposure               |
+|-------------|-----------------------------|----------------------------|--------------------------------|------------------------|
+| `notary`    | `notary` (Rust, raw TCP)    | `deploy/railway/notary`    | auto (`railway.json` in dir)   | **public TCP proxy**   |
+| `verifier`  | `verifier` (Rust, HTTP)     | `deploy/railway/verifier`  | auto (`railway.json` in dir)   | **public HTTPS domain**|
+| `adapter`   | `node sepolia-registry.mjs` | `app/web`                  | `deploy/railway/adapter.json`  | private (internal)     |
+| `submitter` | `node submitter.mjs`        | `app/web`                  | `deploy/railway/submitter.json`| private (internal)     |
+| `ui`        | `vite` dev server           | `app/web`                  | `deploy/railway/ui.json`       | **public HTTPS domain**|
+
+> **The two Rust services live in their own subdirectories** (`deploy/railway/notary`,
+> `deploy/railway/verifier`), each with its own `Dockerfile` + `railway.json`. Point
+> the service's Root Directory there and Railway auto-detects both — no config path to
+> set, and it can never pick up the wrong Dockerfile. The three Node services share
+> `app/web` (one Dockerfile), so they differ only by their config-as-code file.
 
 The **prover is not deployed** — it runs on the agent's own machine (heavy Risc0
 proving) and connects *in* to the public `verifier` (HTTP) and `notary` (raw TCP).
@@ -49,25 +56,28 @@ config — it's optional.
 
 ---
 
-## One-time: build & push the Rust runtime image (notary + verifier)
+## FIRST (do this before deploying notary/verifier): build & push the runtime image
 
-The notary/verifier are prebuilt binaries baked into a GHCR image — Railway just
-pulls it, so there's no 30-min Risc0+tlsn compile on Railway and the verifier's
-guest `image_id` stays byte-identical to the prover's.
+The `notary`/`verifier` Dockerfiles are just `FROM ghcr.io/horizenlabs/por-risc0-runtime`.
+**That image must exist and be pullable by Railway, or those two builds fail at the
+`FROM`** (`failed to pull` / `unauthorized`). Build + push it first:
 
 ```bash
 docker login ghcr.io                       # GitHub PAT with write:packages
 deploy/railway/build-and-push.sh           # builds guest reproducibly, pushes image
 ```
 
-- Push to a path you control and update the `FROM` line in `Dockerfile.risc0`
-  (default `ghcr.io/horizenlabs/por-risc0-runtime:latest`), or set
-  `RISC0_RUNTIME_IMAGE` for the script.
-- Make the GHCR package **public**, or add **private-registry credentials** in
-  Railway, so Railway can pull it.
+Then in GitHub, make the GHCR package **public** (Packages → the package → Settings →
+Change visibility), or add **private-registry credentials** in Railway. Verify from
+another machine: `docker pull ghcr.io/horizenlabs/por-risc0-runtime:latest`.
+
+- Push to a path you control and update the `FROM` line in
+  `deploy/railway/{notary,verifier}/Dockerfile` (default
+  `ghcr.io/horizenlabs/por-risc0-runtime:latest`), or set `RISC0_RUNTIME_IMAGE` for
+  the script.
 - **Re-run this and redeploy `notary`+`verifier` whenever the guest changes** — a
-  verifier built from a different guest will reject every real proof (image_id
-  mismatch). See the note in `build-and-push.sh`.
+  verifier built from a different guest rejects every real proof (image_id mismatch).
+  See the note in `build-and-push.sh`.
 
 The binaries are staged to `deploy/railway/bin/` (git-ignored) and never committed.
 
@@ -75,17 +85,30 @@ The binaries are staged to `deploy/railway/bin/` (git-ignored) and never committ
 
 ## Create the services
 
-For each service, in the Railway dashboard (or `railway.json` config-as-code path):
+**`notary` and `verifier`** (Root Directory does everything):
 
 1. **New Service → GitHub Repo** → this repo.
-2. **Settings → Root Directory** → the value from the table above.
-3. **Settings → Config-as-code** → path to the config file, e.g.
-   `deploy/railway/verifier.json` (paths are relative to the repo root).
-4. Set the **Variables** for that service (below).
-5. Networking (below): public domain / TCP proxy / private-only.
+2. **Settings → Root Directory** → `deploy/railway/notary` (or `.../verifier`).
+   Railway auto-detects the `railway.json` + `Dockerfile` sitting there. Leave the
+   config-as-code path empty — do **not** point it at the repo root.
+3. Set **Variables** + Networking (below).
 
-> `dockerfilePath` in each config is relative to that service's **Root Directory**
-> (`Dockerfile` resolves to `app/web/Dockerfile` or `deploy/railway/Dockerfile.risc0`).
+**`adapter`, `submitter`, `ui`** (share `app/web`, so they need the config path):
+
+1. **New Service → GitHub Repo** → this repo.
+2. **Settings → Root Directory** → `app/web`.
+3. **Settings → Config-as-code** → `deploy/railway/adapter.json` (repo-root-relative;
+   or `submitter.json` / `ui.json`). This sets the start command + healthcheck.
+   *Alternative:* leave config empty and set a **Custom Start Command** in the
+   dashboard instead (`node sepolia-registry.mjs` / `node submitter.mjs` /
+   `npm run dev -- --host 0.0.0.0 --port $PORT`).
+4. Set **Variables** + Networking (below).
+
+> Why subdirs for the Rust services: with Root Directory pointing at a folder that
+> contains exactly one `Dockerfile` named `Dockerfile`, Railway can't misresolve the
+> path or fall back to a repo-root Dockerfile — the failure mode that bit the first
+> attempt. The configs use `builder: DOCKERFILE` with **no** `dockerfilePath`, so the
+> default (`Dockerfile` in the Root Directory) always resolves correctly.
 
 ---
 

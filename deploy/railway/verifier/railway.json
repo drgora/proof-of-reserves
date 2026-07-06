@@ -1,8 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
-    "builder": "DOCKERFILE",
-    "dockerfilePath": "Dockerfile.risc0"
+    "builder": "DOCKERFILE"
   },
   "deploy": {
     "startCommand": "VERIFIER_ADDR=[::]:${PORT:-7100} exec verifier",
