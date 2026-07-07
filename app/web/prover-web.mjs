@@ -23,7 +23,7 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, writeFileSync, readFileSync, existsSync, createReadStream, statSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, createReadStream, statSync, readdirSync } from 'node:fs'
 import { join, extname, normalize } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -39,6 +39,8 @@ mkdirSync(WORK_DIR, { recursive: true })
 // One heavy prove at a time (proving is CPU/RAM-bound; concurrent proves OOM a laptop).
 let proving = false
 const jobs = new Map() // jobId -> { state, phase, verdict, reason, log, challengeId, dir, ... }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.map': 'application/json' }
 
@@ -61,6 +63,73 @@ async function readBody(req, cap = 8 * 1024 * 1024) {
 
 function appendLog(job, s) {
   job.log = (job.log + s).slice(-8000)
+}
+
+// --- durable jobs -----------------------------------------------------------
+// Each job's state is mirrored to dir/job.json so a job survives a server restart
+// (Railway redeploy, crash) and — combined with the client remembering its jobId — so a
+// human who closes the browser mid-flow can reconnect and resume. `dir` is recomputed on
+// load (never trusted from disk), so a moved WORK_DIR still resolves.
+function persistable(job) {
+  return {
+    id: job.id, state: job.state, phase: job.phase, verdict: job.verdict, reason: job.reason,
+    challengeId: job.challengeId, agentId: job.agentId, address: job.address,
+    chainId: job.chainId, threshold: job.threshold,
+    toSign: job.toSign || null, blocks: job.blocks || null, log: job.log || '', challenge: job.challenge,
+  }
+}
+
+function saveJob(job) {
+  try {
+    writeFileSync(join(job.dir, 'job.json'), JSON.stringify(persistable(job)))
+  } catch (e) {
+    console.error(`saveJob ${job.id} failed: ${e.message}`)
+  }
+}
+
+// Reload jobs from WORK_DIR on startup and resume any that were mid-prove. A job caught in
+// `preparing` with no prepare.json can't be resumed (witnesses were never written); one caught
+// in `proving` still has prepare.json + sigs.json on disk, so finalize can be re-run (or, if the
+// receipt was already produced, just re-submitted). We serialize resumes through the prove slot.
+function rehydrate() {
+  let dirs
+  try {
+    dirs = readdirSync(WORK_DIR, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const d of dirs) {
+    if (!d.isDirectory()) continue
+    const f = join(WORK_DIR, d.name, 'job.json')
+    if (!existsSync(f)) continue
+    let saved
+    try {
+      saved = JSON.parse(readFileSync(f, 'utf8'))
+    } catch {
+      continue
+    }
+    saved.dir = join(WORK_DIR, d.name) // recompute; never trust the stored path
+    if (saved.state === 'preparing') {
+      if (existsSync(join(saved.dir, 'prepare.json')) && saved.toSign) saved.state = 'awaiting-signatures'
+      else {
+        saved.state = 'error'
+        saved.reason = 'preparation was interrupted by a restart; start a new proof'
+      }
+    }
+    jobs.set(saved.id, saved)
+  }
+  const resumable = [...jobs.values()].filter((j) => j.state === 'proving')
+  if (resumable.length) {
+    console.log(`resuming ${resumable.length} interrupted proof(s)`)
+    ;(async () => {
+      for (const job of resumable) {
+        while (proving) await sleep(1000)
+        proving = true
+        appendLog(job, `\n[resumed after a server restart]\n`)
+        await runFinalizeAndSubmit(job) // clears `proving` in its finally
+      }
+    })()
+  }
 }
 
 // Run the prover with a set of args, streaming stdout/stderr into the job log. The prover
@@ -124,8 +193,9 @@ async function proveStart(req, res) {
   const dir = join(WORK_DIR, jobId)
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'challenge.json'), JSON.stringify(challenge))
-  const job = { id: jobId, state: 'preparing', phase: 'Fetching on-chain state', verdict: null, reason: null, log: '', challengeId: challenge.challenge_id, dir, agentId, address, challenge }
+  const job = { id: jobId, state: 'preparing', phase: 'Fetching on-chain state', verdict: null, reason: null, log: '', challengeId: challenge.challenge_id, dir, agentId, address, chainId: challenge.chain_id, threshold, challenge, toSign: null, blocks: null }
   jobs.set(jobId, job)
+  saveJob(job)
 
   // Prepare: fetch the account proof + header for each block, emit the to-sign messages.
   try {
@@ -133,22 +203,27 @@ async function proveStart(req, res) {
   } catch (e) {
     job.state = 'error'
     job.reason = /balance .* < threshold/.test(job.log) ? 'wallet balance is below the threshold at one of the challenged blocks' : `prepare failed: ${e.message}`
+    saveJob(job)
     return send(res, 200, { jobId, error: job.reason, log: job.log })
   }
   const prepared = JSON.parse(readFileSync(join(dir, 'prepare.json'), 'utf8'))
+  // Stash the to-sign messages + block list on the job so /status can serve them: a browser
+  // that reconnects while awaiting signatures needs them to re-prompt the wallet.
+  job.toSign = {
+    blockHashes: prepared.to_sign.block_hashes, // personal_sign each (raw 32 bytes)
+    challengePrehash: prepared.to_sign.challenge_prehash,
+  }
+  job.blocks = prepared.blocks.map((b) => ({ number: b.block_number, hash: b.block_hash }))
   job.state = 'awaiting-signatures'
   job.phase = 'Waiting for wallet signatures'
-  const chain = challenge.chain_id
+  saveJob(job)
   return send(res, 200, {
     jobId,
     challengeId: challenge.challenge_id,
-    chainId: chain,
+    chainId: challenge.chain_id,
     threshold,
-    toSign: {
-      blockHashes: prepared.to_sign.block_hashes, // personal_sign each (raw 32 bytes)
-      challengePrehash: prepared.to_sign.challenge_prehash,
-    },
-    blocks: prepared.blocks.map((b) => ({ number: b.block_number, hash: b.block_hash })),
+    toSign: job.toSign,
+    blocks: job.blocks,
   })
 }
 
@@ -168,36 +243,54 @@ async function proveFinalize(req, res) {
   job.state = 'proving'
   job.phase = 'Attesting + proving (this takes a few minutes)'
   proving = true
+  saveJob(job)
   send(res, 202, { jobId, state: job.state })
+  runFinalizeAndSubmit(job) // background; clears `proving` in its finally
+}
 
-  // Background: finalize (attest + prove) → submit to the verifier → record the verdict.
-  ;(async () => {
-    try {
+// Finalize (attest + prove) → submit to the verifier → record the verdict. Shared by the
+// live finalize request and the startup resume of an interrupted `proving` job, so it must be
+// idempotent: if response.json already exists (finalize ran in a previous life) we skip the
+// multi-minute prove and re-submit; if the verifier says "already answered", we fetch the
+// authoritative verdict instead of trusting that reply. Assumes the caller holds the prove slot.
+async function runFinalizeAndSubmit(job) {
+  try {
+    if (!existsSync(join(job.dir, 'response.json'))) {
+      job.phase = 'Attesting + proving (this takes a few minutes)'
+      saveJob(job)
       await runProver(job, ['--finalize', '--prepared', 'prepare.json', '--sigs', 'sigs.json', '--out', 'response.json'])
-      job.phase = 'Submitting to the verifier'
-      const response = readFileSync(join(job.dir, 'response.json'), 'utf8')
-      const sub = await fetch(`${VERIFIER_URL}/v1/challenges/${job.challengeId}/response`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: response,
-      })
-      const verdict = await sub.json().catch(() => null)
-      job.verdict = verdict?.verdict || 'unknown'
-      job.reason = verdict?.reason || null
-      job.state = job.verdict === 'verified' ? 'verified' : 'rejected'
-      job.phase = job.verdict === 'verified' ? 'Verified' : 'Rejected'
-      appendLog(job, `\nverdict: ${job.verdict}${job.reason ? ' — ' + job.reason : ''}\n`)
-    } catch (e) {
-      job.state = 'error'
-      job.reason = e.message
-      appendLog(job, `\nerror: ${e.message}\n`)
-    } finally {
-      proving = false
     }
-  })()
+    job.phase = 'Submitting to the verifier'
+    saveJob(job)
+    const response = readFileSync(join(job.dir, 'response.json'), 'utf8')
+    const sub = await fetch(`${VERIFIER_URL}/v1/challenges/${job.challengeId}/response`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: response,
+    })
+    let verdict = await sub.json().catch(() => null)
+    if (verdict?.reason && /already answered/i.test(String(verdict.reason))) {
+      const st = await fetch(`${VERIFIER_URL}/v1/challenges/${job.challengeId}`).then((r) => r.json()).catch(() => null)
+      if (st?.verdict) verdict = { verdict: st.verdict, reason: st.reason }
+    }
+    job.verdict = verdict?.verdict || 'unknown'
+    job.reason = verdict?.reason || null
+    job.state = job.verdict === 'verified' ? 'verified' : 'rejected'
+    job.phase = job.verdict === 'verified' ? 'Verified' : 'Rejected'
+    appendLog(job, `\nverdict: ${job.verdict}${job.reason ? ' — ' + job.reason : ''}\n`)
+  } catch (e) {
+    job.state = 'error'
+    job.reason = e.message
+    appendLog(job, `\nerror: ${e.message}\n`)
+  } finally {
+    proving = false
+    saveJob(job)
+  }
 }
 
 // --- GET /api/prove/status/:id -----------------------------------------------
+// Full enough to rebuild the UI from scratch: a reconnecting browser rehydrates from this
+// alone (toSign/blocks let it re-prompt the wallet when the job is awaiting signatures).
 function proveStatus(res, jobId) {
   const job = jobs.get(jobId)
   if (!job) return send(res, 404, { error: 'unknown job' })
@@ -208,7 +301,13 @@ function proveStatus(res, jobId) {
     verdict: job.verdict,
     reason: job.reason,
     challengeId: job.challengeId,
-    log: job.log.slice(-4000),
+    chainId: job.chainId,
+    threshold: job.threshold,
+    agentId: job.agentId,
+    address: job.address,
+    toSign: job.toSign || null,
+    blocks: job.blocks || null,
+    log: (job.log || '').slice(-4000),
   })
 }
 
@@ -248,6 +347,8 @@ const server = createServer(async (req, res) => {
     send(res, 500, { error: e.message })
   }
 })
+
+rehydrate() // reload persisted jobs + resume any interrupted proof
 
 server.listen(PORT, () => {
   console.log(`prover-web on http://0.0.0.0:${PORT}`)
