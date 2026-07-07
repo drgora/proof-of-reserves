@@ -12,7 +12,13 @@ const CHAINS = [
   { id: 8453, label: 'Base Sepolia', coin: 'ETH' },
 ]
 
-type ToSign = { blockHashes: `0x${string}`[]; challengePrehash: `0x${string}` }
+type ToSign = {
+  blockHashes: `0x${string}`[]
+  challengePrehash: `0x${string}`
+  // Text message signed to derive the agent's per-agent marketplace identity secret. Optional
+  // so a job prepared before this shipped still resumes (the proof just won't be recordable).
+  identityMessage?: string
+}
 type StartResp = {
   jobId?: string
   challengeId?: string
@@ -112,21 +118,32 @@ export default function ProveReserves() {
   // resume-from-awaiting-signatures path.
   async function signFinalizePoll(jobId: string, toSign: ToSign) {
     const msgs = toSign.blockHashes
+    const hasIdentity = !!toSign.identityMessage
+    const total = msgs.length + 1 + (hasIdentity ? 1 : 0) // blocks + challenge + (identity)
     const sigs: `0x${string}`[] = []
     for (let i = 0; i < msgs.length; i++) {
-      setPhase(`Sign ${i + 1} of ${msgs.length + 1} in your wallet — block ownership`)
+      setPhase(`Sign ${i + 1} of ${total} in your wallet — block ownership`)
       sigs.push(await signMessageAsync({ message: { raw: msgs[i] } }))
       setSignCount(i + 1)
     }
-    setPhase(`Sign ${msgs.length + 1} of ${msgs.length + 1} in your wallet — the challenge`)
+    setPhase(`Sign ${msgs.length + 1} of ${total} in your wallet — the challenge`)
     const ownerSig = await signMessageAsync({ message: { raw: toSign.challengePrehash } })
     setSignCount(msgs.length + 1)
+
+    // Identity binding: derives the agent's per-agent marketplace secret in the wallet — the
+    // private key never leaves the browser. Signed as readable text, so the wallet shows intent.
+    let identitySig: `0x${string}` | undefined
+    if (toSign.identityMessage) {
+      setPhase(`Sign ${total} of ${total} in your wallet — agent identity`)
+      identitySig = await signMessageAsync({ message: toSign.identityMessage })
+      setSignCount(total)
+    }
 
     setPhase('Attesting + proving — this takes a few minutes…')
     const fin = await fetch('/api/prove/finalize', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jobId, blockSigs: sigs, ownerSig }),
+      body: JSON.stringify({ jobId, blockSigs: sigs, ownerSig, identitySig }),
     }).then((r) => r.json())
     if (fin.error) throw new Error(fin.error)
 
@@ -322,7 +339,7 @@ export default function ProveReserves() {
               <h3>How it works</h3>
               <ol className="prove-steps">
                 <li>The verifier picks 3 recent, unpredictable blocks.</li>
-                <li>You sign one message per block + the challenge (no gas).</li>
+                <li>You sign one message per block, the challenge, and a one-time agent identity (no gas).</li>
                 <li>A zkVM proof is generated and checked — balance &amp; address stay private.</li>
               </ol>
               <p className="fine">Proving runs after you sign and takes a few minutes.</p>
@@ -372,7 +389,7 @@ export default function ProveReserves() {
               <div className="phase">{phase}</div>
               {start?.toSign && (
                 <div className="sign-dots">
-                  {Array.from({ length: start.toSign.blockHashes.length + 1 }).map((_, i) => (
+                  {Array.from({ length: start.toSign.blockHashes.length + 1 + (start.toSign.identityMessage ? 1 : 0) }).map((_, i) => (
                     <span key={i} className={`dot ${i < signCount ? 'done' : ''}`} />
                   ))}
                 </div>

@@ -367,6 +367,13 @@ a:hover {
   letter-spacing: 2px;
   text-transform: uppercase;
 }
+/* Pipeline header: the "Clear failed" action sits to the right, count after it. */
+.pipeline-section .section-head {
+  align-items: center;
+}
+.pipeline-section .section-head .btn {
+  margin-left: auto;
+}
 
 .grid {
   display: grid;

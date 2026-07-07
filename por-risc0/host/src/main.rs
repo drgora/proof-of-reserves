@@ -182,18 +182,14 @@ fn prove_block(
     debug: bool,
     challenge_nonce: &[u8; 32],
     agent_id: &[u8; 32],
+    // Marketplace binding: the numeric ERC-721 token id + the private per-agent secret (its
+    // keccak256 is the set-once on-chain commitment). Both are derived per-agent by the caller
+    // (from the challenge agent_id + an owner signature); 0 / zero-secret is inert (demo/legacy).
+    agent_token_id: u64,
+    agent_secret: &[u8; 32],
     seg_po2: u32,
     presentation_b64: Option<String>,
 ) -> Value {
-    // Marketplace binding inputs (per-agent constants). Default to 0 / zero-secret when
-    // unset -- legacy/demo runs don't record on the marketplace, so the values are inert.
-    let agent_token_id: u64 =
-        std::env::var("POR_AGENT_TOKEN_ID").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let agent_secret: [u8; 32] = std::env::var("POR_AGENT_SECRET")
-        .ok()
-        .map(|h| hexb(&h).try_into().expect("POR_AGENT_SECRET must be 32-byte hex"))
-        .unwrap_or([0u8; 32]);
-
     let env = ExecutorEnv::builder()
         .segment_limit_po2(seg_po2)
         .write(&inputs.header_rlp).unwrap()
@@ -210,7 +206,7 @@ fn prove_block(
         .write(challenge_nonce).unwrap()
         .write(agent_id).unwrap()
         .write(&agent_token_id).unwrap() // marketplace ERC-721 token id
-        .write(&agent_secret).unwrap()   // private agent secret (identity binding)
+        .write(agent_secret).unwrap()    // private agent secret (identity binding)
         .build().unwrap();
 
     let t = Instant::now();
@@ -292,6 +288,78 @@ fn connected_target() -> Option<(String, String, String)> {
     let agent_id = arg_value("--agent-id").expect("--verifier requires --agent-id");
     let threshold = arg_value("--threshold").expect("--verifier requires --threshold (wei)");
     Some((verifier_url, agent_id, threshold))
+}
+
+// --- per-agent marketplace identity (see por_types for the derivation contract) -----------
+// The guest commits `agent_token_id` (numeric ERC-721 id) + `identity = keccak256(agent_secret)`;
+// the gateway keys a set-once commitment by the token id and requires the proof to present the
+// matching identity. We derive both PER AGENT so no operator/human sets POR_AGENT_TOKEN_ID /
+// POR_AGENT_SECRET by hand -- though both remain honored as explicit overrides (e.g. an agent
+// already registered under an arbitrary secret).
+
+/// Numeric token id: `POR_AGENT_TOKEN_ID` override, else parsed from the challenge `agent_id`.
+fn resolve_token_id(agent_id_str: &str) -> u64 {
+    if let Ok(v) = std::env::var("POR_AGENT_TOKEN_ID") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            return n;
+        }
+    }
+    por_types::parse_token_id(agent_id_str)
+}
+
+/// The owner signing key used to derive the identity secret: `POR_OWNER_KEY`, else the wallet
+/// key (`POR_PRIVATE_KEY`) -- same precedence as [`owner_sign`], so identity is tied to the
+/// agent's registry owner.
+fn owner_identity_key(fallback: &Option<SigningKey>) -> Option<SigningKey> {
+    if let Ok(k) = std::env::var("POR_OWNER_KEY") {
+        return Some(SigningKey::from_slice(&hexb(&k)).expect("POR_OWNER_KEY must be 32-byte hex"));
+    }
+    fallback.clone()
+}
+
+/// Deterministically derive the agent secret by signing [`por_types::identity_message`] with the
+/// owner key (EIP-191, RFC-6979 -- reproduces the same secret as the browser wallet would).
+fn identity_secret_from_key(sk: &SigningKey, token_id: u64) -> [u8; 32] {
+    let digest = por_types::eip191_digest(por_types::identity_message(token_id).as_bytes());
+    let (sig, _recid) = sk.sign_prehash_recoverable(&digest).unwrap();
+    por_types::secret_from_identity_sig(sig.to_bytes().as_slice())
+}
+
+/// Parse a 32-byte `POR_AGENT_SECRET` override, if set.
+fn secret_override() -> Option<[u8; 32]> {
+    std::env::var("POR_AGENT_SECRET")
+        .ok()
+        .map(|h| hexb(&h).try_into().expect("POR_AGENT_SECRET must be 32-byte hex"))
+}
+
+/// CLI-side secret (connected/file/legacy modes have the owner key): override, else derived from
+/// the owner key, else zero (demo/no key -- inert, never recorded).
+fn resolve_secret_cli(owner_key: &Option<SigningKey>, token_id: u64) -> [u8; 32] {
+    if let Some(s) = secret_override() {
+        return s;
+    }
+    match owner_identity_key(owner_key) {
+        Some(sk) => identity_secret_from_key(&sk, token_id),
+        None => [0u8; 32],
+    }
+}
+
+/// Browser-side secret (`--finalize`): override, else derived from the wallet's identity
+/// signature, else zero (with a warning -- the proof still verifies but can't be recorded).
+fn resolve_secret_from_sig(identity_sig: Option<&str>) -> [u8; 32] {
+    if let Some(s) = secret_override() {
+        return s;
+    }
+    match identity_sig {
+        Some(s) => por_types::secret_from_identity_sig(&hexb(s)),
+        None => {
+            eprintln!(
+                "WARNING: no identity signature and no POR_AGENT_SECRET -> zero identity binding; \
+                 the proof will verify but recordValidation on the marketplace will not match a commitment"
+            );
+            [0u8; 32]
+        }
+    }
 }
 
 // Sign the challenge digest with the owner EOA (POR_OWNER_KEY, falling back to POR_PRIVATE_KEY).
@@ -396,6 +464,11 @@ async fn prove_challenge(
     );
     println!("  header <- {header_url}   proof <- {proof_url}");
 
+    // Per-agent marketplace binding (identical across the 3 blocks). Inert in DEMO (no key):
+    // a demo run shouldn't bind a real agent's commitment, so token id + secret stay 0.
+    let token_id = if debug { 0 } else { resolve_token_id(&ch.agent_id) };
+    let agent_secret = if debug { [0u8; 32] } else { resolve_secret_cli(owner_key, token_id) };
+
     let mut bundles = Vec::with_capacity(ch.blocks.len());
     let t_all = Instant::now();
     for (i, &blk) in ch.blocks.iter().enumerate() {
@@ -405,7 +478,7 @@ async fn prove_challenge(
         ensure_can_prove(inputs.balance, threshold, debug);
         let sig = wallet_sig(&inputs.header_rlp, owner_key);
         let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
-        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
+        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
         bundles.push(bundle);
     }
 
@@ -511,11 +584,14 @@ async fn run_legacy_single(
     ensure_can_prove(inputs.balance, threshold, debug);
 
     let sig = wallet_sig(&inputs.header_rlp, owner_key);
-    // No challenge in legacy mode -> placeholder journal labels.
+    // No challenge in legacy mode -> placeholder journal labels. Marketplace binding comes only
+    // from explicit env overrides here (legacy has no marketplace agent id to derive from).
     let challenge_nonce = [0u8; 32];
     let agent_id: [u8; 32] = keccak256(b"por-demo-agent").into();
+    let token_id = resolve_token_id("");
+    let agent_secret = resolve_secret_cli(owner_key, token_id);
     let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
-    let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
+    let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
 
     File::create("proof.json").unwrap()
         .write_all(serde_json::to_string_pretty(&bundle).unwrap().as_bytes()).unwrap();
@@ -568,21 +644,28 @@ async fn run_prepare(ch: Challenge, address_hex: &str, out: &str) {
         }));
     }
     let challenge_prehash = keccak256(&ch.canonical_bytes().expect("canonical bytes"));
+    // The wallet also signs a per-agent identity message; its signature derives the private
+    // secret whose keccak256 is the (set-once) on-chain commitment. Text message (personal_sign),
+    // not a raw 32-byte blob, so the wallet shows the human what they're binding.
+    let token_id = resolve_token_id(&ch.agent_id);
+    let identity_message = por_types::identity_message(token_id);
     let prepared = serde_json::json!({
         "version": "por-prepare-v1",
         "challenge": serde_json::to_value(&ch).unwrap(),
         "address": addr_norm,
         "debug": false,
+        "agent_token_id": token_id,
         "to_sign": {
-            "scheme": "EIP-191 personal_sign over each 32-byte message (raw bytes)",
+            "scheme": "EIP-191 personal_sign: each block_hash + challenge_prehash as raw 32 bytes; identity_message as text",
             "block_hashes": block_hashes,
             "challenge_prehash": format!("0x{}", hex::encode(challenge_prehash)),
+            "identity_message": identity_message,
         },
         "blocks": blocks_json,
     });
     File::create(out).unwrap()
         .write_all(serde_json::to_string_pretty(&prepared).unwrap().as_bytes()).unwrap();
-    println!("wrote {out}: {} block hash(es) + the challenge prehash to sign", ch.blocks.len());
+    println!("wrote {out}: {} block hash(es) + the challenge prehash + the identity message to sign", ch.blocks.len());
 }
 
 // PHASE 2: take the wallet's signatures (sigs.json = {block_sigs:[...], owner_sig}), verify
@@ -607,6 +690,11 @@ async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: 
     assert_eq!(block_sigs.len(), blocks.len(), "block_sigs ({}) != blocks ({})", block_sigs.len(), blocks.len());
     let mut address = [0u8; 20];
     address.copy_from_slice(&hexb(pv["address"].as_str().expect("address in prepared")));
+
+    // Per-agent marketplace binding: token id from the challenge agent_id, secret derived from
+    // the wallet's identity signature (or POR_AGENT_SECRET override). The key never touches us.
+    let token_id = resolve_token_id(&ch.agent_id);
+    let agent_secret = resolve_secret_from_sig(sv["identity_sig"].as_str());
 
     let t_all = Instant::now();
     let mut bundles = Vec::with_capacity(blocks.len());
@@ -639,7 +727,7 @@ async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: 
         let block_hex = format!("0x{:x}", b["block_number"].as_u64().unwrap());
         println!("[block {}/{}] {block_hex}: signature ok, attesting + proving ...", i + 1, blocks.len());
         let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
-        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
+        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
         bundles.push(bundle);
     }
 

@@ -12,3 +12,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 hex = "0.4"
+
+# Test-only: prove the per-agent secret derivation is byte-identical to a browser wallet's
+# (viem/MetaMask) so the CLI (k256) and the browser produce the same on-chain commitment.
+[dev-dependencies]
+k256 = { version = "0.13", features = ["ecdsa"] }

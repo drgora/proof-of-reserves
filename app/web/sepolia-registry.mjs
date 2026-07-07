@@ -143,6 +143,17 @@ async function pipelineJobs() {
   return pipelineCache.jobs
 }
 
+// Forward a "clear failed jobs" request to the submitter (which owns the pipeline state). The
+// submitter's clear endpoint sits next to /pipeline; invalidate our cache so the next poll is fresh.
+async function clearFailedPipeline() {
+  if (!PIPELINE_URL) return { enabled: false, cleared: 0 }
+  const url = PIPELINE_URL.replace(/\/[^/]*$/, '') + '/pipeline/clear-failed'
+  const res = await fetch(url, { method: 'POST', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(5000) })
+  if (!res.ok) throw Object.assign(new Error(`clear-failed HTTP ${res.status}`), { status: 502 })
+  pipelineCache = { at: 0, jobs: [] } // force a re-fetch on the next /api/pipeline
+  return res.json()
+}
+
 // --- receipts from on-chain ValidationGateway logs -------------------------
 // Each ValidationGateway.recordValidation emits ValidationRecorded(agentId indexed,
 // validationId indexed, string proofType, uint256 attestationId, bytes32 leaf,
@@ -585,6 +596,13 @@ const routes = [
 http
   .createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`)
+    if (req.method === 'POST' && url.pathname === '/api/pipeline/clear-failed') {
+      try {
+        return send(res, 200, await clearFailedPipeline())
+      } catch (e) {
+        return send(res, e?.status || 502, { error: e?.message || 'clear failed' })
+      }
+    }
     if (req.method !== 'GET') return send(res, 404, { error: 'not found' })
     const route = routes.find((r) => r.pattern.test(url.pathname))
     if (!route) return send(res, 404, { error: 'not found' })

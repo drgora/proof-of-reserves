@@ -1,6 +1,7 @@
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useDirectory, useOverview, usePipeline } from '../hooks'
-import { fmtNum, fmtTime, timeAgo, type AgentRow, type DirectoryMode } from '../api'
+import { api, fmtNum, fmtTime, timeAgo, type AgentRow, type DirectoryMode } from '../api'
 import { ErrorBox, Loading, NetworkBadge, PipelineTimeline, PorBadge, TypeBadge, VerifiedBadge } from '../components'
 
 export default function Directory() {
@@ -11,6 +12,31 @@ export default function Directory() {
   const o = overview.data
   const d = dir.data
   const p = pipeline.data
+
+  // Locally hide jobs we've asked the node to clear, so they vanish instantly (the backend
+  // clear + refetch confirms it within a poll or two). Keyed by jobId, which is unique per run.
+  const [clearedIds, setClearedIds] = useState<Set<string>>(new Set())
+  const [clearing, setClearing] = useState(false)
+  const pipelineJobs = (p?.jobs ?? []).filter((j) => !clearedIds.has(j.jobId))
+  const failedJobs = pipelineJobs.filter((j) => j.stage === 'FAILED')
+  async function clearFailed() {
+    const ids = failedJobs.map((j) => j.jobId)
+    setClearing(true)
+    setClearedIds((prev) => new Set([...prev, ...ids])) // optimistic hide, instantly
+    try {
+      await api.clearFailedPipeline()
+    } catch {
+      // Backend clear didn't take — un-hide so the view reflects reality (with the error visible).
+      setClearedIds((prev) => {
+        const next = new Set(prev)
+        ids.forEach((id) => next.delete(id))
+        return next
+      })
+    } finally {
+      pipeline.refetch()
+      setClearing(false)
+    }
+  }
   const challengeCount = d ? d.agents.reduce((n, a) => n + (a.challengeCount ?? 0), 0) : null
   // The single most recently recorded challenge across all listed agents.
   const lastPassed = d?.agents
@@ -34,10 +60,15 @@ export default function Directory() {
         </p>
       </section>
 
-      {p?.enabled && p.jobs.length > 0 && (
+      {p?.enabled && pipelineJobs.length > 0 && (
         <section className="pipeline-section">
           <div className="section-head">
             <h2>Verification pipeline</h2>
+            {failedJobs.length > 0 && (
+              <button className="btn ghost small" onClick={clearFailed} disabled={clearing}>
+                {clearing ? 'Clearing…' : `Clear ${failedJobs.length} failed`}
+              </button>
+            )}
             <span className="count">live · this node</span>
           </div>
           <p className="section-sub">
@@ -46,7 +77,7 @@ export default function Directory() {
             receipt below.
           </p>
           <PipelineTimeline
-            jobs={p.jobs}
+            jobs={pipelineJobs}
             explorer={p.explorer || d?.explorer}
             baseExplorer={p.baseExplorer || d?.baseExplorer}
           />

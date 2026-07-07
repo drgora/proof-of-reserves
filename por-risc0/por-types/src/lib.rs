@@ -35,6 +35,55 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
     o
 }
 
+// --- per-agent marketplace identity (single source of truth) ----------------
+// The guest commits two marketplace binding fields: the numeric ERC-721 `agent_token_id`
+// and `identity = keccak256(agent_secret)`. Both the CLI prover (which signs with the owner
+// key) and the browser flow (which signs in the wallet) derive `agent_secret` the SAME way
+// here, so the on-chain commitment (`keccak256(agent_secret)`, registered set-once) matches
+// whichever path proves. Kept in por-types so prover, verifier, and the offset helper agree.
+
+/// Parse a registry agent id (`"5868"` or `"0x16ec"`) into its numeric ERC-721 token id.
+/// Returns 0 when the id isn't numeric (demo / non-marketplace agents) -- an inert binding.
+pub fn parse_token_id(agent_id: &str) -> u64 {
+    let s = agent_id.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16).unwrap_or(0),
+        None => s.parse::<u64>().unwrap_or(0),
+    }
+}
+
+/// The message an agent OWNER signs (EIP-191 `personal_sign`) to derive its private identity
+/// secret. Deterministic ECDSA (RFC 6979, low-S -- what MetaMask/Rabby/k256 all produce) means
+/// the same owner key always yields the same signature, hence the same secret and the same
+/// commitment. FROZEN: the commitment is registered set-once, so changing this string would
+/// lock out every agent already registered under it (see the freeze test below).
+pub fn identity_message(token_id: u64) -> String {
+    format!(
+        "Horizen Proof-of-Reserves\n\
+         Agent identity binding v1\n\
+         agent: {token_id}\n\
+         Signing derives this agent's private proving secret. Only sign on the official prover."
+    )
+}
+
+/// EIP-191 `personal_sign` digest over an arbitrary-length message -- exactly what a browser
+/// wallet hashes-then-signs, so the CLI (which signs this digest with k256) matches the wallet.
+pub fn eip191_digest(message: &[u8]) -> [u8; 32] {
+    let mut m = Vec::with_capacity(28 + message.len());
+    m.extend_from_slice(b"\x19Ethereum Signed Message:\n");
+    m.extend_from_slice(message.len().to_string().as_bytes());
+    m.extend_from_slice(message);
+    keccak256(&m)
+}
+
+/// Derive the 32-byte agent secret from an EIP-191 signature over [`identity_message`]. Uses
+/// only r‖s (the first 64 bytes), so a wallet's v=27/28 vs a recid of 0/1 -- which never change
+/// r or s -- yields the same secret regardless of the signature's recovery-byte convention.
+pub fn secret_from_identity_sig(sig: &[u8]) -> [u8; 32] {
+    let n = sig.len().min(64);
+    keccak256(&sig[..n])
+}
+
 /// A verifier-issued challenge. `nonce`/`agent_id`/`threshold`/`chain_id`/`blocks` are the
 /// security-relevant fields covered by the owner signature; the rest is routing/metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +141,12 @@ impl Challenge {
     /// (format-agnostic across registry id shapes; not a raw address).
     pub fn agent_id_hash(&self) -> [u8; 32] {
         keccak256(self.agent_id.as_bytes())
+    }
+
+    /// Numeric ERC-721 marketplace token id this challenge's `agent_id` denotes (the value the
+    /// guest commits as `agent_token_id` and the gateway keys the identity commitment by).
+    pub fn agent_token_id(&self) -> u64 {
+        parse_token_id(&self.agent_id)
     }
 
     /// Fixed-width canonical serialization of the security-relevant challenge fields.
@@ -184,5 +239,72 @@ mod tests {
         let mut c3 = c.clone();
         c3.agent_id = "0xdeadbeef".into();
         assert_ne!(c.challenge_digest().unwrap(), c3.challenge_digest().unwrap());
+    }
+
+    #[test]
+    fn token_id_parses_decimal_and_hex() {
+        assert_eq!(parse_token_id("5868"), 5868);
+        assert_eq!(parse_token_id("0x16ec"), 0x16ec);
+        assert_eq!(parse_token_id("0x16EC"), 0x16ec);
+        assert_eq!(parse_token_id(" 5868 "), 5868);
+        assert_eq!(parse_token_id("not-a-number"), 0); // demo/non-marketplace -> inert
+        let mut c = sample();
+        c.agent_id = "5868".into();
+        assert_eq!(c.agent_token_id(), 5868);
+    }
+
+    #[test]
+    fn identity_message_frozen() {
+        // FROZEN: this string seeds a set-once on-chain commitment. If this assertion ever needs
+        // updating, every already-registered agent is locked out -- treat that as a breaking change.
+        assert_eq!(
+            identity_message(5868),
+            "Horizen Proof-of-Reserves\n\
+             Agent identity binding v1\n\
+             agent: 5868\n\
+             Signing derives this agent's private proving secret. Only sign on the official prover."
+        );
+    }
+
+    #[test]
+    fn secret_derivation_is_deterministic_and_v_agnostic() {
+        let sig64: Vec<u8> = (0u8..64).collect();
+        // r‖s only: appending a v byte (27/28 or 0/1) must not change the secret.
+        let mut with_v27 = sig64.clone();
+        with_v27.push(27);
+        let mut with_v0 = sig64.clone();
+        with_v0.push(0);
+        assert_eq!(secret_from_identity_sig(&sig64), secret_from_identity_sig(&with_v27));
+        assert_eq!(secret_from_identity_sig(&sig64), secret_from_identity_sig(&with_v0));
+    }
+
+    #[test]
+    fn eip191_digest_matches_manual_prefix() {
+        // Same construction the wallet uses for personal_sign of a text message.
+        let msg = b"hello";
+        let mut m = Vec::new();
+        m.extend_from_slice(b"\x19Ethereum Signed Message:\n5hello");
+        assert_eq!(eip191_digest(msg), keccak256(&m));
+    }
+
+    // Cross-implementation freeze: the CLI (k256) MUST derive the exact secret a browser wallet
+    // does, or the CLI-proved and browser-proved commitments would differ. The expected value
+    // was computed with viem (`privateKeyToAccount(key).signMessage`) -- representative of
+    // MetaMask/Rabby -- for private key 0x00..01 signing identity_message(5868). If this ever
+    // fails, deterministic/low-S ECDSA agreement between k256 and the wallet broke.
+    #[test]
+    fn secret_matches_browser_wallet() {
+        use k256::ecdsa::SigningKey;
+        let mut key = [0u8; 32];
+        key[31] = 1;
+        let sk = SigningKey::from_slice(&key).unwrap();
+        let digest = eip191_digest(identity_message(5868).as_bytes());
+        let (sig, _recid) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let secret = secret_from_identity_sig(sig.to_bytes().as_slice());
+        assert_eq!(
+            hex::encode(secret),
+            "2935256a9ec8b5a5dad46717878e4e2f6b6c852e99e4ed109210a0262ab891fe",
+            "k256 secret diverged from the viem/MetaMask-derived value"
+        );
     }
 }

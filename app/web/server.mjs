@@ -289,6 +289,17 @@ async function getPipeline() {
   })
 }
 
+// Forward a "clear failed jobs" request to the submitter (which owns the pipeline state), then
+// drop our 2s pipeline cache so the next poll reflects the removal immediately.
+async function clearFailedPipeline() {
+  if (!PIPELINE_URL) return { enabled: false, cleared: 0 }
+  const url = PIPELINE_URL.replace(/\/[^/]*$/, '') + '/pipeline/clear-failed'
+  const res = await fetch(url, { method: 'POST', headers: { accept: 'application/json' } })
+  if (!res.ok) throw Object.assign(new Error(`clear-failed HTTP ${res.status}`), { status: 502 })
+  cache.delete('pipeline')
+  return res.json()
+}
+
 function detailToRow(detail) {
   const a = detail.agent || {}
   const r = detail.receipts || {}
@@ -360,6 +371,11 @@ const routes = [
     method: 'GET',
     pattern: /^\/api\/pipeline$/,
     handler: () => getPipeline(),
+  },
+  {
+    method: 'POST',
+    pattern: /^\/api\/pipeline\/clear-failed$/,
+    handler: () => clearFailedPipeline(),
   },
   {
     method: 'GET',

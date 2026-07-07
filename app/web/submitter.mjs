@@ -51,6 +51,11 @@ const CTX_HASH = process.env.POR_CTX_HASH || keccak256(toBytes('risc0'))
 const FORCED_VERSION_HASH = process.env.POR_VERSION_HASH || null
 const AGENT_ID_OFFSET = Number(process.env.AGENT_ID_OFFSET || 416)
 const AGENT_ID_LENGTH = Number(process.env.AGENT_ID_LENGTH || 8)
+// Journal byte offset of the identity field (keccak256(agent_secret), committed as [u64;4]).
+// The gateway reads it little-endian; the registered commitment is that value as bytes32 =
+// the 32 journal bytes reversed. Measured layout; see por-hl-marketplace-gateway-v2 memory.
+const IDENTITY_BINDING_OFFSET = Number(process.env.IDENTITY_BINDING_OFFSET || 424)
+const ZERO32 = '0x' + '0'.repeat(64)
 const DOMAIN_ID = BigInt(process.env.DOMAIN_ID || 2)
 const GATEWAY = (process.env.GATEWAY || '0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920')
 const ATTESTATION = (process.env.ATTESTATION || '0x0807C544D38aE7729f8798388d89Be6502A1e8A8')
@@ -92,6 +97,21 @@ const gatewayAbi = [
     outputs: [{ name: 'validationId', type: 'uint256' }],
   },
   { type: 'function', name: 'protocolFee', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  {
+    type: 'function', name: 'agentCommitments', stateMutability: 'view',
+    inputs: [{ name: 'agentId', type: 'uint256' }, { name: 'proofType', type: 'string' }],
+    outputs: [{ type: 'bytes32' }],
+  },
+  {
+    type: 'function', name: 'registerAgentCommitment', stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'proofType', type: 'string' },
+      { name: 'commitment', type: 'bytes32' },
+      { name: 'asRegistrar', type: 'bool' },
+    ],
+    outputs: [],
+  },
 ]
 const attestationAbi = [{
   type: 'function', name: 'proofsAggregations', stateMutability: 'view',
@@ -109,6 +129,56 @@ const publicClient = createPublicClient({ chain: baseSepolia, transport: viemHtt
 const walletClient = account
   ? createWalletClient({ account, chain: baseSepolia, transport: viemHttp(RPC_URL) })
   : null
+
+// Registrar key for auto-registering per-agent identity commitments (asRegistrar=true requires
+// msg.sender == proofTypeRegistrar[proofType]). Defaults to the recording wallet (PRIVATE_KEY),
+// which IS the registrar in our deployment; override with POR_REGISTRAR_KEY if they differ.
+const registrarAccount = process.env.POR_REGISTRAR_KEY
+  ? privateKeyToAccount(process.env.POR_REGISTRAR_KEY.startsWith('0x') ? process.env.POR_REGISTRAR_KEY : `0x${process.env.POR_REGISTRAR_KEY}`)
+  : account
+const registrarClient = registrarAccount
+  ? createWalletClient({ account: registrarAccount, chain: baseSepolia, transport: viemHttp(RPC_URL) })
+  : null
+
+// The identity commitment this proof presents, read from its own journal: bytes32(_extractField(
+// pubs, IDENTITY_BINDING_OFFSET, 32, LE)) == the 32 journal bytes reversed. Registering exactly
+// this makes recordValidation's commitment check pass for the same proof.
+function extractIdentityCommitment(pubsBytes) {
+  const start = 2 + IDENTITY_BINDING_OFFSET * 2
+  const le = pubsBytes.slice(start, start + 64)
+  if (le.length < 64) return null
+  return '0x' + le.match(/../g).reverse().join('')
+}
+
+// Register the agent's identity commitment if it isn't set yet (set-once, first-claim-wins).
+// Derived from the proof's journal, so it always matches. No-op when: already registered (the
+// agent keeps its original commitment — a mismatch there means the proof used a different secret
+// and recordValidation will surface it), agentId is 0, or the identity is the zero-secret hash.
+async function ensureCommitment(agentId, pubsBytes) {
+  if (agentId === 0n) return
+  const commitment = extractIdentityCommitment(pubsBytes)
+  if (!commitment || commitment === ZERO32) {
+    console.warn(`[submitter] agent ${agentId}: journal identity is unset (zero-secret) — not auto-registering`)
+    return
+  }
+  const existing = await publicClient.readContract({
+    address: GATEWAY, abi: gatewayAbi, functionName: 'agentCommitments', args: [agentId, PROOF_TYPE],
+  })
+  if (existing && existing !== ZERO32) return // set-once; leave the original in place
+  if (!registrarClient) {
+    console.warn(`[submitter] agent ${agentId}: no registrar key (PRIVATE_KEY / POR_REGISTRAR_KEY) — cannot auto-register commitment`)
+    return
+  }
+  await withTxLock(async () => {
+    const { request } = await publicClient.simulateContract({
+      account: registrarAccount, address: GATEWAY, abi: gatewayAbi,
+      functionName: 'registerAgentCommitment', args: [agentId, PROOF_TYPE, commitment, true],
+    })
+    const tx = await registrarClient.writeContract(request)
+    await publicClient.waitForTransactionReceipt({ hash: tx })
+    console.log(`[submitter] registered identity commitment ${commitment} for agent ${agentId} (tx ${tx})`)
+  })
+}
 
 // --- pipeline state (in-memory; the UI polls a snapshot) --------------------
 const jobs = new Map() // jobId -> PipelineJob
@@ -241,6 +311,10 @@ async function runPipeline(bundle, meta = {}) {
     }
     if (!relayed) throw new Error('attestation relay to Base Sepolia timed out (retry later)')
 
+    // 4.5 ensure the agent's identity commitment is registered (set-once) so recordValidation's
+    // mandatory identity-binding check passes. Derived from this proof's own journal.
+    await ensureCommitment(agentId, pubsBytes)
+
     // 5. recordValidation (exact protocol fee)
     upsert(jobId, { stage: 'RECORDING' })
     const fee = await publicClient.readContract({ address: GATEWAY, abi: gatewayAbi, functionName: 'protocolFee' })
@@ -313,6 +387,14 @@ http.createServer(async (req, res) => {
       const response = body.responsePath ? JSON.parse(await readFile(body.responsePath, 'utf8')) : body
       const ids = await submitResponse(response)
       return send(res, 202, { accepted: ids })
+    }
+    // Evict terminal FAILED jobs from the live pipeline. They never leave on their own (a retry
+    // creates a fresh job), so without this they accumulate in the "live" panel indefinitely.
+    if (req.method === 'POST' && url.pathname === '/pipeline/clear-failed') {
+      let cleared = 0
+      for (const [id, j] of jobs) if (j.stage === 'FAILED') { jobs.delete(id); cleared++ }
+      console.log(`[submitter] cleared ${cleared} failed job(s) from the pipeline`)
+      return send(res, 200, { cleared })
     }
     return send(res, 404, { error: 'not found' })
   } catch (e) {

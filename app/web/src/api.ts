@@ -172,11 +172,22 @@ async function get<T>(url: string): Promise<T> {
   return r.json() as Promise<T>
 }
 
+async function post<T>(url: string): Promise<T> {
+  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' } })
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}))
+    throw new Error((e as any).error || `HTTP ${r.status}`)
+  }
+  return r.json() as Promise<T>
+}
+
 export const api = {
   overview: () => get<Overview>('/api/overview'),
   agents: () => get<Directory>('/api/agents'),
   agent: (id: string) => get<AgentDetail>(`/api/agents/${encodeURIComponent(id)}`),
   pipeline: () => get<Pipeline>('/api/pipeline'),
+  // Ask the node's submitter to drop terminal FAILED jobs from the live pipeline.
+  clearFailedPipeline: () => post<{ cleared: number }>('/api/pipeline/clear-failed'),
 }
 
 // ---------------- formatting helpers ----------------

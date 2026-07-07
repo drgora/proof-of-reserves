@@ -212,6 +212,7 @@ async function proveStart(req, res) {
   job.toSign = {
     blockHashes: prepared.to_sign.block_hashes, // personal_sign each (raw 32 bytes)
     challengePrehash: prepared.to_sign.challenge_prehash,
+    identityMessage: prepared.to_sign.identity_message, // personal_sign as text -> per-agent secret
   }
   job.blocks = prepared.blocks.map((b) => ({ number: b.block_number, hash: b.block_hash }))
   job.state = 'awaiting-signatures'
@@ -236,10 +237,13 @@ async function proveFinalize(req, res) {
   if (job.state !== 'awaiting-signatures') return send(res, 409, { error: `job is ${job.state}` })
   const blockSigs = body.blockSigs
   const ownerSig = body.ownerSig
+  // identitySig derives the agent's per-agent marketplace secret (see por-types). Required for
+  // the proof to be recordable on the marketplace; the challenge/verifier verdict works without it.
+  const identitySig = body.identitySig
   if (!Array.isArray(blockSigs) || !ownerSig) return send(res, 400, { error: 'need blockSigs[] and ownerSig' })
   if (proving) return send(res, 429, { error: 'the prover is busy with another proof; try again shortly' })
 
-  writeFileSync(join(job.dir, 'sigs.json'), JSON.stringify({ block_sigs: blockSigs, owner_sig: ownerSig }))
+  writeFileSync(join(job.dir, 'sigs.json'), JSON.stringify({ block_sigs: blockSigs, owner_sig: ownerSig, identity_sig: identitySig }))
   job.state = 'proving'
   job.phase = 'Attesting + proving (this takes a few minutes)'
   proving = true
@@ -311,10 +315,20 @@ function proveStatus(res, jobId) {
   })
 }
 
-// Proxy any other /api/* (GET) to the registry adapter so the directory keeps working.
+// Proxy any other /api/* to the registry adapter so the directory keeps working. Forwards the
+// method + body too, so mutations like POST /api/pipeline/clear-failed reach the adapter.
 async function proxyRegistry(req, res, path) {
   try {
-    const r = await fetch(`${REGISTRY_URL}${path}`, { headers: { accept: 'application/json' } })
+    const method = req.method || 'GET'
+    const init = { method, headers: { accept: 'application/json' } }
+    if (method !== 'GET' && method !== 'HEAD') {
+      const body = await readBody(req)
+      if (body) {
+        init.body = body
+        init.headers['content-type'] = 'application/json'
+      }
+    }
+    const r = await fetch(`${REGISTRY_URL}${path}`, init)
     const buf = Buffer.from(await r.arrayBuffer())
     send(res, r.status, buf, { 'content-type': r.headers.get('content-type') || 'application/json' })
   } catch (e) {
