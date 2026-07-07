@@ -132,8 +132,12 @@ async fn run_notary<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     handle.close();
     let mut socket = driver_task.await??;
 
-    let mut request_bytes = Vec::new();
-    socket.read_to_end(&mut request_bytes).await?;
+    // Length-prefixed request (u32 BE length + bytes), NO half-close dependency — must match
+    // attest.rs so the exchange survives L4 proxies that collapse TCP half-close (e.g. Railway).
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let mut request_bytes = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+    socket.read_exact(&mut request_bytes).await?;
     let request: AttestationRequest = bincode::deserialize(&request_bytes)?;
 
     let signer = Box::new(Secp256k1Signer::new(&signing_key.to_bytes())?);
@@ -185,7 +189,9 @@ async fn run_notary<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     let attestation = builder.build(&provider)?;
 
     let attestation_bytes = bincode::serialize(&attestation)?;
+    socket.write_all(&(attestation_bytes.len() as u32).to_be_bytes()).await?;
     socket.write_all(&attestation_bytes).await?;
+    socket.flush().await?;
     socket.close().await?;
 
     Ok(())

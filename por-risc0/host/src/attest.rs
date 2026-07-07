@@ -7,6 +7,13 @@
 // the verifier can keccak the revealed response to recover block_hash and match it
 // to the Risc0 journal. Ported from por-zk's `por_core` (Noir parts removed).
 use std::future::IntoFuture;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead as TokioRead, AsyncWrite as TokioWrite, ReadBuf};
 
 use anyhow::{anyhow, bail, Result};
 use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -53,15 +60,78 @@ fn received_commitments(tc: &[TranscriptCommitment]) -> Vec<&PlaintextHash> {
         .collect()
 }
 
-/// MPC-TLS-attest `debug_getRawHeader(block_hex)` to `rpc_host` via the notary at
-/// `notary_addr`. Returns `bincode(Presentation)`.
-pub async fn attest_header(notary_addr: &str, rpc_host: &str, block_hex: &str) -> Result<Vec<u8>> {
+/// Bytes transferred over the notary connection during one attestation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttestStats {
+    /// prover -> notary (the uplink-bound direction; dominates the MPC cost)
+    pub up_bytes: u64,
+    /// notary -> prover
+    pub down_bytes: u64,
+}
+
+/// Wraps a stream and tallies bytes read/written, so callers can report the transfer size
+/// + effective throughput of the (bandwidth-heavy) MPC session.
+struct CountingStream<S> {
+    inner: S,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+}
+impl<S> CountingStream<S> {
+    fn new(inner: S, up: Arc<AtomicU64>, down: Arc<AtomicU64>) -> Self {
+        Self { inner, up, down }
+    }
+}
+impl<S: TokioRead + Unpin> TokioRead for CountingStream<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &r {
+            self.down.fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        r
+    }
+}
+impl<S: TokioWrite + Unpin> TokioWrite for CountingStream<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r {
+            self.up.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &r {
+            self.up.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Core attestation, writing byte counts into caller-provided counters (so callers can read
+/// the transfer size even if the session fails partway).
+async fn attest_header_inner(
+    notary_addr: &str,
+    rpc_host: &str,
+    block_hex: &str,
+    up: &Arc<AtomicU64>,
+    down: &Arc<AtomicU64>,
+) -> Result<Vec<u8>> {
     let notary_socket = tokio::net::TcpStream::connect(notary_addr)
         .await
         .map_err(|e| anyhow!("connect notary {notary_addr}: {e}"))?;
     notary_socket.set_nodelay(true)?;
 
-    let session = Session::new(notary_socket.compat());
+    let session = Session::new(CountingStream::new(notary_socket, up.clone(), down.clone()).compat());
     let (driver, mut handle) = session.split();
     let driver_task = tokio::spawn(driver);
 
@@ -167,10 +237,18 @@ pub async fn attest_header(notary_addr: &str, rpc_host: &str, block_hex: &str) -
 
     handle.close();
     let mut socket = driver_task.await??;
-    socket.write_all(&bincode::serialize(&att_request)?).await?;
-    socket.close().await?;
-    let mut attestation_bytes = Vec::new();
-    socket.read_to_end(&mut attestation_bytes).await?;
+    // Length-prefixed request/response (u32 BE length + bytes), NO TCP half-close: the exchange
+    // must survive L4 proxies that collapse a half-close (shutdown-write) into a full teardown
+    // (e.g. Railway's public TCP proxy) — read_to_end + close() relied on half-close as the
+    // message delimiter and EOF'd there. Must stay in lockstep with notary.rs.
+    let req = bincode::serialize(&att_request)?;
+    socket.write_all(&(req.len() as u32).to_be_bytes()).await?;
+    socket.write_all(&req).await?;
+    socket.flush().await?;
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let mut attestation_bytes = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+    socket.read_exact(&mut attestation_bytes).await?;
     let attestation: Attestation = bincode::deserialize(&attestation_bytes)?;
 
     let provider = CryptoProvider::default();
@@ -178,6 +256,39 @@ pub async fn attest_header(notary_addr: &str, rpc_host: &str, block_hex: &str) -
 
     let presentation = build_presentation(&attestation, &secrets, &received_ranges)?;
     Ok(bincode::serialize(&presentation)?)
+}
+
+/// MPC-TLS-attest `debug_getRawHeader(block_hex)` to `rpc_host` via the notary at
+/// `notary_addr`. Returns `(bincode(Presentation), transfer stats)`.
+pub async fn attest_header(
+    notary_addr: &str,
+    rpc_host: &str,
+    block_hex: &str,
+) -> Result<(Vec<u8>, AttestStats)> {
+    let up = Arc::new(AtomicU64::new(0));
+    let down = Arc::new(AtomicU64::new(0));
+    let bytes = attest_header_inner(notary_addr, rpc_host, block_hex, &up, &down).await?;
+    Ok((
+        bytes,
+        AttestStats {
+            up_bytes: up.load(Ordering::Relaxed),
+            down_bytes: down.load(Ordering::Relaxed),
+        },
+    ))
+}
+
+/// Diagnostic variant: runs the attestation writing byte counts into `up`/`down` as it goes,
+/// so the caller can read how much transferred EVEN IF it fails partway — to distinguish a
+/// data cap (fails at ~constant bytes) from a time cap (fails at ~constant time) on a flaky
+/// transport such as a proxy.
+pub async fn attest_header_probe(
+    notary_addr: &str,
+    rpc_host: &str,
+    block_hex: &str,
+    up: &Arc<AtomicU64>,
+    down: &Arc<AtomicU64>,
+) -> Result<Vec<u8>> {
+    attest_header_inner(notary_addr, rpc_host, block_hex, up, down).await
 }
 
 /// Reveal the WHOLE transcript (no secrets in a debug_getRawHeader exchange).

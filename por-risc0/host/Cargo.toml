@@ -39,7 +39,7 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "0fe3c32d35382b3f290a43c4156399ca4512bb89", features = ["mozilla-certs"] }
 tlsn-formats = { git = "https://github.com/tlsnotary/tlsn", rev = "0fe3c32d35382b3f290a43c4156399ca4512bb89" }
 spansy = { git = "https://github.com/tlsnotary/tlsn-utils", rev = "64722f7" }
-tokio = { version = "1.38", features = ["rt", "rt-multi-thread", "macros", "net", "io-std", "io-util"] }
+tokio = { version = "1.38", features = ["rt", "rt-multi-thread", "macros", "net", "io-std", "io-util", "time"] }
 tokio-util = "0.7"
 futures = "0.3"
 hyper = { version = "1.1", features = ["client", "http1", "server"] }

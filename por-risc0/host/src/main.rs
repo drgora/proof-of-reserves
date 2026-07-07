@@ -71,6 +71,18 @@ fn hexb(s: &str) -> Vec<u8> {
 fn h32(s: &str) -> [u8; 32] { let v = hexb(s); let mut a = [0u8; 32]; a[32 - v.len()..].copy_from_slice(&v); a }
 fn hu128(s: &str) -> u128 { let v = hexb(s); let mut a = [0u8; 16]; a[16 - v.len()..].copy_from_slice(&v); u128::from_be_bytes(a) }
 
+// Normalize a 65-byte EIP-191 wallet signature (`0x` r‖s‖v). Browser wallets return v in
+// {27,28} (occasionally {0,1}); the guest + verifier's k256 `RecoveryId::from_byte` needs
+// {0,1}. Returns raw 65 bytes with a normalized recid.
+fn norm_sig(hex_sig: &str) -> Vec<u8> {
+    let mut v = hexb(hex_sig);
+    assert_eq!(v.len(), 65, "signature must be 65 bytes r||s||v, got {}", v.len());
+    if v[64] >= 27 {
+        v[64] -= 27;
+    }
+    v
+}
+
 // POST a JSON body via stdin (a full response with 3 receipts can be ~1.5 MB, past ARG_MAX
 // for an inline --data argv).
 fn curl_post_stdin(url: &str, body: &str) -> Vec<u8> {
@@ -241,10 +253,15 @@ async fn maybe_attest(block_hex: &str, rpc_host: &str) -> Option<String> {
     match std::env::var("NOTARY_ADDR") {
         Ok(addr) => {
             println!("    attesting debug_getRawHeader({block_hex}) via notary {addr} -> {rpc_host} ...");
-            let bytes = attest::attest_header(&addr, rpc_host, block_hex)
+            let (bytes, stats) = attest::attest_header(&addr, rpc_host, block_hex)
                 .await
                 .expect("TLSNotary attestation failed");
-            println!("    attestation OK: {} byte presentation", bytes.len());
+            println!(
+                "    attestation OK: {} byte presentation ({:.1} MB up / {:.1} MB down to notary)",
+                bytes.len(),
+                stats.up_bytes as f64 / 1e6,
+                stats.down_bytes as f64 / 1e6
+            );
             Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
         }
         Err(_) => None,
@@ -320,6 +337,25 @@ async fn main() {
     // Legacy mode picks its own chain (no verifier), so it honors POR_TESTNET here.
     let testnet = std::env::var("POR_TESTNET").is_ok();
     let seg_po2: u32 = std::env::var("POR_SEGMENT_PO2").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+
+    // Browser-wallet mode (the private key never touches the prover). Two phases:
+    //   --prepare  --challenge <ch> --address <0x..> [--out prepare.json]
+    //   --finalize --prepared prepare.json --sigs sigs.json [--out response.json]
+    // The wallet signs the messages listed in prepare.json between the two calls.
+    if std::env::args().any(|a| a == "--prepare") {
+        let ch = load_challenge().expect("--prepare requires --challenge <file> (or POR_CHALLENGE)");
+        let address = arg_value("--address").expect("--prepare requires --address <0x..>");
+        let out = arg_value("--out").unwrap_or_else(|| "prepare.json".into());
+        run_prepare(ch, &address, &out).await;
+        return;
+    }
+    if std::env::args().any(|a| a == "--finalize") {
+        let prepared = arg_value("--prepared").unwrap_or_else(|| "prepare.json".into());
+        let sigs = arg_value("--sigs").expect("--finalize requires --sigs <file>");
+        let out = arg_value("--out").unwrap_or_else(|| "response.json".into());
+        run_finalize(&prepared, &sigs, &out, seg_po2).await;
+        return;
+    }
 
     match connected_target() {
         // Connected: request challenge -> prove -> submit -> verdict, against a live verifier.
@@ -484,4 +520,132 @@ async fn run_legacy_single(
     File::create("proof.json").unwrap()
         .write_all(serde_json::to_string_pretty(&bundle).unwrap().as_bytes()).unwrap();
     println!("wrote proof.json");
+}
+
+// --- Browser-wallet mode: sign in the wallet, prove on the machine. Split into two phases
+//     so the wallet's private key never touches the prover -- the browser signs the messages
+//     emitted by `--prepare` and hands them back to `--finalize`. Always OWNERSHIP (debug=false).
+
+// PHASE 1: fetch the account proof + raw header for `address_hex` at each challenged block,
+// check balance >= T, and write prepare.json -- the witnesses plus the exact 32-byte EIP-191
+// messages the wallet must personal_sign (each block_hash + the challenge prehash). No key,
+// no proving. The messages are derived here (in Rust, from por-types) so the canonical
+// challenge serialization stays single-source and can't drift in the browser.
+async fn run_prepare(ch: Challenge, address_hex: &str, out: &str) {
+    let chain_id = ch.chain_id;
+    let spec = chain_spec(chain_id).unwrap_or_else(|| panic!("challenge names unsupported chain_id {chain_id}"));
+    let header_url = verify::header_rpc_url(chain_id).expect("header rpc url");
+    let proof_url = verify::proof_rpc_url(chain_id).expect("proof rpc url");
+    let threshold = ch.threshold_u128().expect("challenge threshold");
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hexb(address_hex));
+    let addr_norm = format!("0x{}", hex::encode(address));
+    println!(
+        "prepare: agent {}, chain {}({chain_id}), threshold {} (native), wallet {addr_norm}, blocks {:?}",
+        ch.agent_id, spec.name, threshold as f64 / 1e18, ch.blocks
+    );
+
+    let mut blocks_json = Vec::with_capacity(ch.blocks.len());
+    let mut block_hashes = Vec::with_capacity(ch.blocks.len());
+    for &blk in ch.blocks.iter() {
+        let block_hex = format!("0x{blk:x}");
+        let inputs = fetch_block(&block_hex, &addr_norm, &header_url, &proof_url);
+        ensure_can_prove(inputs.balance, threshold, false);
+        let bh = keccak256(&inputs.header_rlp);
+        let bh_hex = format!("0x{}", hex::encode(bh));
+        println!("  block #{blk}: balance ok, block_hash {bh_hex}");
+        block_hashes.push(Value::String(bh_hex.clone()));
+        blocks_json.push(serde_json::json!({
+            "block_number": blk,
+            "block_hash": bh_hex,
+            "header_rlp": format!("0x{}", hex::encode(&inputs.header_rlp)),
+            "account_proof": inputs.account_proof.iter()
+                .map(|n| Value::String(format!("0x{}", hex::encode(n)))).collect::<Vec<_>>(),
+            "nonce": inputs.nonce,
+            "balance": format!("0x{:x}", inputs.balance),
+            "storage_hash": format!("0x{}", hex::encode(inputs.storage_hash)),
+            "code_hash": format!("0x{}", hex::encode(inputs.code_hash)),
+        }));
+    }
+    let challenge_prehash = keccak256(&ch.canonical_bytes().expect("canonical bytes"));
+    let prepared = serde_json::json!({
+        "version": "por-prepare-v1",
+        "challenge": serde_json::to_value(&ch).unwrap(),
+        "address": addr_norm,
+        "debug": false,
+        "to_sign": {
+            "scheme": "EIP-191 personal_sign over each 32-byte message (raw bytes)",
+            "block_hashes": block_hashes,
+            "challenge_prehash": format!("0x{}", hex::encode(challenge_prehash)),
+        },
+        "blocks": blocks_json,
+    });
+    File::create(out).unwrap()
+        .write_all(serde_json::to_string_pretty(&prepared).unwrap().as_bytes()).unwrap();
+    println!("wrote {out}: {} block hash(es) + the challenge prehash to sign", ch.blocks.len());
+}
+
+// PHASE 2: take the wallet's signatures (sigs.json = {block_sigs:[...], owner_sig}), verify
+// each block signature recovers to the wallet address exactly as the guest will (fail fast,
+// before the slow prove), then attest + prove each block and assemble response.json. The
+// wallet's v (27/28) is normalized to the {0,1} recid the guest/verifier expect.
+async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: u32) {
+    let pv: Value = serde_json::from_str(&std::fs::read_to_string(prepared_path).expect("read prepared"))
+        .expect("parse prepared json");
+    let sv: Value = serde_json::from_str(&std::fs::read_to_string(sigs_path).expect("read sigs"))
+        .expect("parse sigs json");
+    let ch: Challenge = serde_json::from_value(pv["challenge"].clone()).expect("challenge in prepared");
+    let chain_id = ch.chain_id;
+    let spec = chain_spec(chain_id).unwrap_or_else(|| panic!("challenge names unsupported chain_id {chain_id}"));
+    let threshold = ch.threshold_u128().expect("challenge threshold");
+    let challenge_nonce = ch.nonce_bytes().expect("challenge nonce");
+    let agent_id = ch.agent_id_hash();
+    let debug = false;
+
+    let blocks = pv["blocks"].as_array().expect("blocks array in prepared");
+    let block_sigs = sv["block_sigs"].as_array().expect("block_sigs array in sigs");
+    assert_eq!(block_sigs.len(), blocks.len(), "block_sigs ({}) != blocks ({})", block_sigs.len(), blocks.len());
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hexb(pv["address"].as_str().expect("address in prepared")));
+
+    let t_all = Instant::now();
+    let mut bundles = Vec::with_capacity(blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        let inputs = BlockInputs {
+            header_rlp: hexb(b["header_rlp"].as_str().unwrap()),
+            account_proof: b["account_proof"].as_array().unwrap().iter()
+                .map(|n| hexb(n.as_str().unwrap())).collect(),
+            address,
+            nonce: b["nonce"].as_u64().unwrap(),
+            balance: hu128(b["balance"].as_str().unwrap()),
+            storage_hash: h32(b["storage_hash"].as_str().unwrap()),
+            code_hash: h32(b["code_hash"].as_str().unwrap()),
+        };
+        let sig = norm_sig(block_sigs[i].as_str().expect("block sig hex"));
+
+        // Preflight: the wallet's ownership signature must recover to the wallet address,
+        // exactly as the guest checks it -- catch a wrong/bad signature before burning minutes
+        // on a proof the guest would reject.
+        let block_hash = keccak256(&inputs.header_rlp);
+        let mut m = Vec::with_capacity(28 + 32);
+        m.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
+        m.extend_from_slice(block_hash.as_slice());
+        let prehash = keccak256(&m);
+        let rec = verify::recover_address_from_prehash(&prehash.0, &sig)
+            .unwrap_or_else(|e| panic!("block {i} signature invalid: {e}"));
+        assert_eq!(rec, address, "block {i} signature recovers 0x{} != wallet 0x{}",
+            hex::encode(rec), hex::encode(address));
+
+        let block_hex = format!("0x{:x}", b["block_number"].as_u64().unwrap());
+        println!("[block {}/{}] {block_hex}: signature ok, attesting + proving ...", i + 1, blocks.len());
+        let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
+        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, seg_po2, presentation);
+        bundles.push(bundle);
+    }
+
+    let owner_sig = format!("0x{}", hex::encode(norm_sig(sv["owner_sig"].as_str().expect("owner_sig in sigs"))));
+    let response = Response { version: RESPONSE_VERSION.into(), challenge: ch, owner_sig, bundles };
+    File::create(out).unwrap()
+        .write_all(serde_json::to_string_pretty(&response).unwrap().as_bytes()).unwrap();
+    println!("proved {} block(s) in {:?}; wrote {out}", response.bundles.len(), t_all.elapsed());
 }

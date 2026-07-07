@@ -18,3 +18,12 @@ por.bundle.json
 /deploy/railway/bin/
 
 .DS_Store
+
+# staged (transient) external-user image build artifacts — never committed
+deploy/prover/prover
+deploy/prover/r0vm
+deploy/prove-web/prover
+deploy/prove-web/r0vm
+deploy/prove-web/notary_probe
+deploy/prove-web/prover-web.mjs
+deploy/prove-web/dist/

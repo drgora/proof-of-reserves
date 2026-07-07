@@ -14,6 +14,9 @@ export default function App() {
             </span>
           </Link>
           <span className="header-spacer" />
+          <Link className="header-link" to="/prove">
+            Prove reserves
+          </Link>
           <a
             className="header-link"
             href="https://agent-registry.horizenlabs.io"

@@ -12,8 +12,11 @@
 # (Arch, glibc ~2.41). Bookworm (glibc 2.36) is too old and the binaries won't load.
 # If the binaries fail at startup on a missing .so, add it to the apt list below.
 FROM debian:trixie-slim
+# curl is REQUIRED: the verifier shells out to `curl` for the registry owner-lookup and the
+# RPC head-pin (verifier.rs). Without it every lookup fails and the verifier reports
+# "agent not found in registry" for every agent. libssl/libstdc++/libgomp: binary runtime deps.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 libstdc++6 libgomp1 \
+        ca-certificates curl libssl3 libstdc++6 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # The notary persists its secp256k1 key to `notary-signing-key.bin` in its CWD.
