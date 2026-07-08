@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useDirectory, useOverview, usePipeline } from '../hooks'
 import { api, fmtNum, fmtTime, timeAgo, type AgentRow, type DirectoryMode } from '../api'
+import { agentIdDecimal } from '../chain'
 import { ErrorBox, Loading, NetworkBadge, PipelineTimeline, PorBadge, TypeBadge, VerifiedBadge } from '../components'
 
 export default function Directory() {
@@ -110,8 +111,10 @@ export default function Directory() {
             <span className="lc-when">{timeAgo(lastPassed.c.recordedAt)}</span>
           </div>
           <div className="lc-body">
-            <span className="lc-agent">{lastPassed.agent.name || lastPassed.agent.agentId}</span>{' '}
-            proved <span className="lc-strong">≥ {lastPassed.c.threshold ?? '—'}</span>
+            <span className="lc-agent">
+              {lastPassed.agent.name || `Agent #${agentIdDecimal(lastPassed.agent.agentId)}`}
+            </span>{' '}
+            proved <span className="lc-strong">≥&nbsp;{lastPassed.c.threshold ?? '—'}</span>
             {lastPassed.c.chain && (
               <>
                 {' '}on <span className="chip">{lastPassed.c.chain}</span>
@@ -166,7 +169,7 @@ function AgentCard({ agent, mode }: { agent: AgentRow; mode: DirectoryMode }) {
       <div className="top">
         <div>
           <div className="name">{agent.name || 'Unnamed agent'}</div>
-          <div className="id">{agent.agentId}</div>
+          <div className="id">#{agentIdDecimal(agent.agentId)}</div>
         </div>
         {isPor ? <PorBadge /> : <VerifiedBadge />}
       </div>
@@ -180,6 +183,17 @@ function AgentCard({ agent, mode }: { agent: AgentRow; mode: DirectoryMode }) {
         ))}
       </div>
 
+      {agent.lastChallenge?.threshold && (
+        <div className="card-proved">
+          <span className="cp-label">Reserves proved</span>
+          <span className="cp-value">≥&nbsp;{agent.lastChallenge.threshold}</span>
+          <span className="cp-sub">
+            {agent.lastChallenge.chain ? `${agent.lastChallenge.chain} · ` : ''}
+            {agent.lastChallenge.proofCount} blocks · {timeAgo(agent.lastChallenge.recordedAt)}
+          </span>
+        </div>
+      )}
+
       <div className="metrics">
         <div className="metric">
           <div className="v">{fmtNum(agent.receipts)}</div>
@@ -190,14 +204,6 @@ function AgentCard({ agent, mode }: { agent: AgentRow; mode: DirectoryMode }) {
           <div className="k">Challenges</div>
         </div>
       </div>
-
-      {agent.lastChallenge && (
-        <div className="card-last">
-          Last: ≥ {agent.lastChallenge.threshold ?? '—'}
-          {agent.lastChallenge.chain ? ` on ${agent.lastChallenge.chain}` : ''} ·{' '}
-          {agent.lastChallenge.proofCount} blocks
-        </div>
-      )}
 
       <div className="foot">Last activity {timeAgo(agent.lastActivity)}</div>
     </Link>

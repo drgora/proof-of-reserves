@@ -39,6 +39,24 @@ export const CONTRACTS: ContractInfo[] = [
   },
 ]
 
+/**
+ * Agent id as a plain decimal integer for display (e.g. `0x16ec` → `5868`). The registry keys
+ * agents by an ERC-721 token id, which the adapters return as `0x`-hex; humans read the decimal.
+ * Display-only — routing and marketplace links keep the canonical id. Non-numeric ids (demo
+ * agents) pass through unchanged.
+ */
+export function agentIdDecimal(id: string): string {
+  const s = String(id || '').trim()
+  if (/^0x[0-9a-fA-F]+$/.test(s)) {
+    try {
+      return BigInt(s).toString()
+    } catch {
+      return s
+    }
+  }
+  return s
+}
+
 const trim = (u: string) => u.replace(/\/$/, '')
 
 /** BaseScan link for the Base Sepolia `recordValidation` transaction. */

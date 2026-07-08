@@ -1267,3 +1267,71 @@ small.err { color: var(--hl-error); }
 .md-doc th, .md-doc td { border: 1px solid var(--hl-border); padding: 7px 10px; text-align: left; vertical-align: top; }
 .md-doc th { background: var(--hl-grey-light); font-family: var(--font-head); font-size: 12px; }
 .md-doc tbody tr:nth-child(even) { background: rgba(4, 23, 66, 0.02); }
+
+/* Challenge-window note on /prove (the configured window is read from the verifier's /v1/info). */
+.window-note { margin: -4px 0 2px; line-height: 1.5; }
+.window-note strong { color: var(--hl-navy); font-weight: 700; }
+
+/* ---- Focal "reserves proved" on directory cards + banner ------------------ */
+.agent-card .card-proved {
+  margin-top: 14px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: var(--hl-teal-badge-bg);
+  border: 1px solid var(--hl-teal);
+  border-left: 3px solid var(--hl-teal);
+}
+.card-proved .cp-label {
+  font-family: var(--font-body);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  font-weight: 700;
+  color: var(--hl-teal-text);
+}
+.card-proved .cp-value {
+  font-family: var(--font-head);
+  font-size: 25px;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.4px;
+  color: var(--hl-navy);
+}
+.card-proved .cp-sub { font-size: 11.5px; color: var(--hl-grey-text); }
+
+/* Make the proved threshold in the "last passed challenge" banner read as the headline. */
+.last-challenge .lc-strong {
+  font-family: var(--font-head);
+  font-size: 1.2em;
+  white-space: nowrap;
+}
+
+/* ---- Prominent covered-window bar on the agent page ----------------------- */
+.challenge-window {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 14px;
+  padding: 11px 16px;
+  background: var(--hl-teal-badge-bg);
+  border-left: 3px solid var(--hl-teal);
+}
+.challenge-window .cw-label {
+  font-family: var(--font-body);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  font-weight: 700;
+  color: var(--hl-teal-text);
+}
+.challenge-window .cw-dur {
+  font-family: var(--font-head);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--hl-navy);
+  line-height: 1;
+}
+.challenge-window .cw-span { font-size: 13px; color: var(--hl-grey-text); }
+.challenge-window .cw-arrow { color: var(--hl-teal-text); font-weight: 700; }

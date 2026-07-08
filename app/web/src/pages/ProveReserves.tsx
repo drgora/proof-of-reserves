@@ -12,6 +12,12 @@ const CHAINS = [
   { id: 8453, label: 'Base Sepolia', coin: 'ETH' },
 ]
 
+// The verifier's configured challenge window is how many days the 3 blocks span — surfaced so a
+// user knows they must have held >= the threshold across that whole window, not just right now.
+// Read from the verifier's /v1/info (CORS-enabled); the verifier base is discovered from the
+// backend's /api/health, falling back to the deployed verifier.
+const DEFAULT_VERIFIER = 'https://verifier-production-d672.up.railway.app'
+
 type ToSign = {
   blockHashes: `0x${string}`[]
   challengePrehash: `0x${string}`
@@ -89,6 +95,9 @@ export default function ProveReserves() {
   // Advanced, optional: a custom 32-byte identity secret. Blank = derive from the wallet.
   // Not persisted anywhere (it's key material) — re-enter it if you resume a challenge.
   const [customSecret, setCustomSecret] = useState('')
+  // The verifier's configured challenge window in days (from /v1/info). null until fetched, or
+  // if the verifier doesn't report it (older build) — the UI degrades to generic wording.
+  const [windowDays, setWindowDays] = useState<number | null>(null)
 
   const [phase, setPhase] = useState<string>('') // human-facing step label
   const [busy, setBusy] = useState(false)
@@ -109,10 +118,32 @@ export default function ProveReserves() {
   useEffect(() => {
     addrRef.current = address
   }, [address])
+
+  // Discover the verifier's configured challenge window once, for display. Best-effort: find the
+  // verifier base via /api/health (falls back to the deployed one), then read /v1/info.window_days.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      let base = DEFAULT_VERIFIER
+      try {
+        const h = await fetch('/api/health').then((r) => (r.ok ? r.json() : null))
+        if (h?.verifier) base = String(h.verifier).replace(/\/$/, '')
+      } catch {}
+      try {
+        const info = await fetch(`${base}/v1/info`).then((r) => (r.ok ? r.json() : null))
+        if (!cancelled && info?.window_days) setWindowDays(Number(info.window_days))
+      } catch {}
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
   // Set by the Cancel button to break out of an account-switch wait.
   const abortRef = useRef(false)
 
   const chain = CHAINS.find((c) => c.id === chainId) || CHAINS[0]
+  // e.g. "~3-day" — null while unknown so wording can fall back to a generic "challenge window".
+  const windowLabel = windowDays ? `~${windowDays}-day` : null
   const thresholdWei = useMemo(() => {
     try {
       return parseEther(amount as `${number}`).toString()
@@ -431,6 +462,12 @@ export default function ProveReserves() {
             </label>
           </div>
 
+          <p className="hint window-note">
+            Your wallet must have held ≥ the threshold across the whole{' '}
+            {windowLabel ? <strong>{windowLabel}</strong> : ''} challenge window — the 3 blocks
+            sample it at unpredictable, finalized points, so a momentary top-up won't pass.
+          </p>
+
           <details className="advanced">
             <summary>Advanced: custom identity secret</summary>
             <label className="field">
@@ -468,7 +505,10 @@ export default function ProveReserves() {
             <div className="prove-idle">
               <h3>How it works</h3>
               <ol className="prove-steps">
-                <li>The verifier picks 3 recent, unpredictable blocks.</li>
+                <li>
+                  The verifier picks 3 recent, unpredictable blocks
+                  {windowLabel ? ` spread across a ${windowLabel} window` : ''}.
+                </li>
                 <li>
                   Your <b>reserves wallet</b> signs one message per block to prove it controls the
                   funds (no gas).
@@ -505,7 +545,9 @@ export default function ProveReserves() {
               )}
               {start?.blocks && (
                 <div className="blocks">
-                  <span className="blocks-label">Challenged blocks ({chain.label})</span>
+                  <span className="blocks-label">
+                    Challenged blocks ({chain.label}){windowLabel ? ` · ${windowLabel} window` : ''}
+                  </span>
                   {start.blocks.map((b) => (
                     <span key={b.number} className="mono block-pill">
                       #{b.number}
@@ -571,7 +613,9 @@ export default function ProveReserves() {
               )}
               {start?.blocks && (
                 <div className="blocks">
-                  <span className="blocks-label">Challenged blocks ({chain.label})</span>
+                  <span className="blocks-label">
+                    Challenged blocks ({chain.label}){windowLabel ? ` · ${windowLabel} window` : ''}
+                  </span>
                   {start.blocks.map((b) => (
                     <span key={b.number} className="mono block-pill">
                       #{b.number}

@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useAgent } from '../hooks'
 import { fmtNum, fmtTime, shortHash, type Receipt } from '../api'
-import { baseAddressUrl, baseTxUrl, marketplaceAgentUrl } from '../chain'
+import { agentIdDecimal, baseAddressUrl, baseTxUrl, marketplaceAgentUrl } from '../chain'
 import { ErrorBox, Loading, NetworkBadge, PorBadge, TypeBadge, VerifiedBadge } from '../components'
 
 export default function AgentDetail() {
@@ -31,7 +31,7 @@ export default function AgentDetail() {
         {!a.active && <span className="badge type">inactive</span>}
       </div>
       <div className="detail-sub">
-        <span className="detail-id mono">{a.agentId}</span>
+        <span className="detail-id mono">Agent #{agentIdDecimal(a.agentId)}</span>
         <a
           className="marketplace-link"
           href={marketplaceAgentUrl(d.marketplace, a.agentId)}
@@ -53,7 +53,7 @@ export default function AgentDetail() {
       <div className="panels">
         <div className="panel">
           <h3>Identity</h3>
-          <KV k="Agent ID" v={<span className="mono">{a.agentId}</span>} />
+          <KV k="Agent ID" v={<span className="mono">{agentIdDecimal(a.agentId)}</span>} />
           <KV
             k="Owner"
             v={
@@ -181,6 +181,7 @@ function ChallengeList({ items, baseExplorer }: { items: Receipt[]; baseExplorer
 }
 
 function ChallengeCard({ c, baseExplorer }: { c: Challenge; baseExplorer?: string }) {
+  const dur = c.first && c.last ? formatDuration(c.first, c.last) : null
   return (
     <div className="challenge">
       <div className="challenge-head">
@@ -199,12 +200,16 @@ function ChallengeCard({ c, baseExplorer }: { c: Challenge; baseExplorer?: strin
         <span className="challenge-meta">
           {c.items.length} proof{c.items.length > 1 ? 's' : ''}
         </span>
-        {c.first && c.last && (
-          <span className="challenge-meta">
-            Covered {fmtTime(c.first)} → {fmtTime(c.last)}
-          </span>
-        )}
       </div>
+      {c.first && c.last && (
+        <div className="challenge-window">
+          <span className="cw-label">Reserves held across</span>
+          <span className="cw-dur">{dur}</span>
+          <span className="cw-span">
+            {fmtTime(c.first)} <span className="cw-arrow">→</span> {fmtTime(c.last)}
+          </span>
+        </div>
+      )}
       <div className="table-wrap">
         <table className="receipts">
           <thead>
@@ -253,6 +258,20 @@ function ChallengeCard({ c, baseExplorer }: { c: Challenge; baseExplorer?: strin
       </div>
     </div>
   )
+}
+
+// Human-readable span between the earliest and latest reference block a challenge covered —
+// the window over which reserves were continuously proven (e.g. "3d 4h", "18h", "42m").
+function formatDuration(a: string, b: string): string {
+  const ms = Math.abs(new Date(b).getTime() - new Date(a).getTime())
+  if (!isFinite(ms) || ms <= 0) return 'a moment'
+  const mins = Math.round(ms / 60000)
+  const days = Math.floor(mins / 1440)
+  const hrs = Math.floor((mins % 1440) / 60)
+  const rem = mins % 60
+  if (days >= 1) return hrs ? `${days}d ${hrs}h` : `${days}d`
+  if (hrs >= 1) return rem ? `${hrs}h ${rem}m` : `${hrs}h`
+  return `${mins}m`
 }
 
 function KV({ k, v }: { k: string; v: ReactNode }) {
