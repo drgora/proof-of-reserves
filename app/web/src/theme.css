@@ -1169,6 +1169,10 @@ select.input { cursor: pointer; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
 .hint { color: var(--hl-grey-text); font-size: 12px; }
 
+/* Recommended-flow callout: a teal (not amber) accent so it reads as guidance, not a warning. */
+.prove-privacy { border-left-color: var(--hl-teal-text); background: var(--hl-teal-badge-bg); margin: 4px 0; font-size: 13px; }
+.prove-privacy .dot { color: var(--hl-teal-text); }
+
 .prove-status { min-height: 220px; }
 .prove-idle h3 { margin: 0 0 12px; }
 .prove-steps { margin: 0; padding-left: 20px; color: var(--hl-grey-text); }
@@ -1177,6 +1181,12 @@ select.input { cursor: pointer; }
 
 .prove-running { text-align: center; padding: 20px 0; }
 .prove-running .phase { font-family: var(--font-head); font-weight: 700; color: var(--hl-navy); margin-bottom: 16px; }
+.fine.warn { color: var(--hl-warning); }
+
+/* Account-switch prompt (two-account flow: reserves wallet F ↔ owner O). */
+.switch-card { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 8px 0 4px; }
+.switch-card .phase { margin-bottom: 4px; }
+.switch-target { font-size: 14px; padding: 8px 14px; background: var(--hl-teal-badge-bg); border: 1px solid var(--hl-teal-text); color: var(--hl-navy); word-break: break-all; max-width: 100%; }
 .sign-dots { display: flex; gap: 8px; justify-content: center; margin-bottom: 18px; }
 .sign-dots .dot { width: 12px; height: 12px; border: 2px solid var(--hl-grey-input); background: var(--hl-white); }
 .sign-dots .dot.done { background: var(--hl-teal); border-color: var(--hl-teal-text); }
@@ -1190,6 +1200,19 @@ select.input { cursor: pointer; }
 .badge.bad { color: var(--hl-error); background: rgba(239, 68, 68, 0.1); border-color: var(--hl-error); }
 .badge.big { font-size: 15px; padding: 8px 16px; }
 .result-actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+
+.advanced { margin: -4px 0 2px; }
+.advanced > summary {
+  cursor: pointer;
+  font-family: var(--font-head);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--hl-grey-text);
+  padding: 6px 0;
+}
+.advanced .field { margin-top: 10px; }
+small.err { color: var(--hl-error); }
 
 .prove-log { margin-top: 16px; }
 .prove-log summary { cursor: pointer; font-family: var(--font-head); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--hl-grey-text); }

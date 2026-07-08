@@ -4,11 +4,18 @@
 // binary in its two-phase browser-wallet mode so the wallet's private key never leaves the
 // browser. One self-contained container: `docker run -p 8080:8080 …` → open localhost:8080.
 //
-// Flow (see /api/prove/* below):
-//   1. browser connects wallet, POSTs {agentId, threshold, chainId, address}
-//   2. we check address == the agent's registered owner, ask the verifier for a challenge,
-//      run `prover --prepare` (fetch state, no key) → return the 32-byte messages to sign
-//   3. browser personal_signs each message, POSTs the signatures
+// Flow (see /api/prove/* below). Two wallet roles — kept separate so the funded wallet stays
+// unlinkable from the public agent identity (the RECOMMENDED way to prove):
+//   • reserves wallet F — the connected account whose native balance we prove (signs each block's
+//     ownership message; its address stays private, in-circuit).
+//   • owner O — the agent's registered owner; authorizes the challenge (owner_sig) so the verifier
+//     can authenticate the agent. F and O may (and ideally should) be different accounts.
+//   1. browser connects the reserves wallet F, POSTs {agentId, threshold, chainId, address: F}
+//   2. we look up the agent's registered owner O (F need NOT equal O), ask the verifier for a
+//      challenge, run `prover --prepare --address F` (fetch state, no key) → return the 32-byte
+//      messages to sign + O so the browser can prompt an account switch
+//   3. browser personal_signs the block messages with F, then switches to O and signs the
+//      challenge + identity, POSTs the signatures
 //   4. we run `prover --finalize` (attest + prove, minutes), submit to the verifier, and
 //      surface the verdict via /api/prove/status polling
 //
@@ -73,7 +80,7 @@ function appendLog(job, s) {
 function persistable(job) {
   return {
     id: job.id, state: job.state, phase: job.phase, verdict: job.verdict, reason: job.reason,
-    challengeId: job.challengeId, agentId: job.agentId, address: job.address,
+    challengeId: job.challengeId, agentId: job.agentId, address: job.address, owner: job.owner,
     chainId: job.chainId, threshold: job.threshold,
     toSign: job.toSign || null, blocks: job.blocks || null, log: job.log || '', challenge: job.challenge,
   }
@@ -168,12 +175,13 @@ async function proveStart(req, res) {
     return send(res, 400, { error: 'need agentId, a 0x address, and a decimal wei threshold' })
   }
 
-  // Require registration: the connected wallet must be the agent's registered owner.
+  // The agent must be registered so we know its owner O (the verifier authenticates the agent by
+  // requiring owner_sig to recover to O). The connected wallet is the RESERVES wallet F whose funds
+  // we prove — it need NOT be O. O authorizes the challenge separately (signed in the browser by the
+  // owner account); we return O here so the UI can prompt the account switch. Proving an F distinct
+  // from O keeps the funded wallet unlinkable from the public agent identity — the recommended flow.
   const owner = await lookupOwner(agentId)
   if (!owner) return send(res, 404, { error: `agent "${agentId}" is not registered on the marketplace` })
-  if (owner.toLowerCase() !== address.toLowerCase()) {
-    return send(res, 403, { error: `connected wallet ${address} is not the registered owner (${owner}) of agent ${agentId}` })
-  }
 
   // Ask the verifier for a challenge.
   const chReq = await fetch(`${VERIFIER_URL}/v1/challenges`, {
@@ -193,7 +201,7 @@ async function proveStart(req, res) {
   const dir = join(WORK_DIR, jobId)
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'challenge.json'), JSON.stringify(challenge))
-  const job = { id: jobId, state: 'preparing', phase: 'Fetching on-chain state', verdict: null, reason: null, log: '', challengeId: challenge.challenge_id, dir, agentId, address, chainId: challenge.chain_id, threshold, challenge, toSign: null, blocks: null }
+  const job = { id: jobId, state: 'preparing', phase: 'Fetching on-chain state', verdict: null, reason: null, log: '', challengeId: challenge.challenge_id, dir, agentId, address, owner, chainId: challenge.chain_id, threshold, challenge, toSign: null, blocks: null }
   jobs.set(jobId, job)
   saveJob(job)
 
@@ -223,6 +231,8 @@ async function proveStart(req, res) {
     challengeId: challenge.challenge_id,
     chainId: challenge.chain_id,
     threshold,
+    address,       // reserves wallet F (echoed back so the client can carry it through resume)
+    owner,         // agent owner O — the account that must authorize the challenge
     toSign: job.toSign,
     blocks: job.blocks,
   })
@@ -240,10 +250,16 @@ async function proveFinalize(req, res) {
   // identitySig derives the agent's per-agent marketplace secret (see por-types). Required for
   // the proof to be recordable on the marketplace; the challenge/verifier verdict works without it.
   const identitySig = body.identitySig
+  // Optional advanced override: a custom 32-byte identity secret (e.g. an agent already
+  // registered under a specific secret). Takes precedence over the wallet-derived one.
+  const agentSecret = body.agentSecret
   if (!Array.isArray(blockSigs) || !ownerSig) return send(res, 400, { error: 'need blockSigs[] and ownerSig' })
+  if (agentSecret && !/^0x[0-9a-fA-F]{64}$/.test(agentSecret)) {
+    return send(res, 400, { error: 'agentSecret must be 0x followed by 64 hex chars (32 bytes)' })
+  }
   if (proving) return send(res, 429, { error: 'the prover is busy with another proof; try again shortly' })
 
-  writeFileSync(join(job.dir, 'sigs.json'), JSON.stringify({ block_sigs: blockSigs, owner_sig: ownerSig, identity_sig: identitySig }))
+  writeFileSync(join(job.dir, 'sigs.json'), JSON.stringify({ block_sigs: blockSigs, owner_sig: ownerSig, identity_sig: identitySig, agent_secret: agentSecret }))
   job.state = 'proving'
   job.phase = 'Attesting + proving (this takes a few minutes)'
   proving = true
@@ -309,6 +325,7 @@ function proveStatus(res, jobId) {
     threshold: job.threshold,
     agentId: job.agentId,
     address: job.address,
+    owner: job.owner || null,
     toSign: job.toSign || null,
     blocks: job.blocks || null,
     log: (job.log || '').slice(-4000),

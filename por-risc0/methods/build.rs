@@ -2,6 +2,11 @@ use risc0_build::{DockerOptionsBuilder, GuestOptionsBuilder};
 use std::collections::HashMap;
 
 fn main() {
+    // Re-run this script when the Docker flag flips, so toggling RISC0_USE_DOCKER actually
+    // rebuilds the guest. Without this, cargo reuses the cached build-script output and a
+    // `RISC0_USE_DOCKER=1` build silently keeps the previous (local, wrong-image_id) ELF.
+    println!("cargo:rerun-if-env-changed=RISC0_USE_DOCKER");
+
     // Reproducible guest build. When RISC0_USE_DOCKER=1, compile the guest inside the
     // pinned `risczero/risc0-guest-builder` container (risc0-build 3.0.5 default tag
     // r0.1.88.0) against the guest's committed Cargo.lock (`cargo build --locked`). This

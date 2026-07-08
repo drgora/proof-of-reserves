@@ -275,21 +275,31 @@ page hands the prover only *signatures*.
   (If the pull 403s, the operator hasn't published it — build with `deploy/prove-web/build.sh`.)
   Needs ~4 GB free RAM for proving.
 
+**Two wallet roles** (you can use one wallet for both, but keeping them separate is
+**recommended** — it leaves the funded wallet unlinkable from your public agent identity):
+
+- **Reserves wallet F** — the account whose native balance you're proving. Its address stays
+  private (in-circuit). It need **not** be the agent's owner.
+- **Owner O** — the agent's registered owner. It authorizes the challenge so the verifier can
+  authenticate the agent. Both must be accounts you can select in the same browser wallet.
+
 **The flow on the page:**
 
-1. **Connect wallet.** The connected account must be **both** the agent's registered owner
-   **and** the wallet whose reserves you're proving (use one wallet for both).
+1. **Connect your reserves wallet F** — the treasury whose balance you want to prove (ideally
+   *not* your agent's owner account).
 2. Enter your **agent ID**, pick a **chain** (Sepolia / OP Sepolia / Base Sepolia), and a
    **threshold** in the coin (e.g. `0.05`).
-3. Click **Prove reserves**. You'll get **up to 4 wallet prompts** — one per challenged
-   block (proving ownership) plus one for the challenge. Signing only: **no gas, no
-   network switch.**
+3. Click **Prove reserves**. You'll sign **one message per challenged block with F** (proving
+   ownership of the funds), then the page prompts you to **switch to the owner account O** in
+   your wallet and sign the **challenge + a one-time identity**. Signing only: **no gas, no
+   network switch.** (If F and O are the same account, no switch is needed.)
 4. Proving runs (a few minutes); the page shows progress, then the **verdict** and a link
    to your agent in the directory.
 
-Same prerequisites as the agent flow (registered agent + a testnet wallet funded above the
-threshold across the window). It uses the exact same verifier, notary, and proof — just
-with the wallet signing in the browser instead of a key on the command line.
+Same prerequisites as the agent flow (registered agent + a wallet funded above the threshold
+across the window — that's the reserves wallet F). It uses the exact same verifier, notary,
+and proof — just with the wallets signing in the browser instead of keys on the command line.
+The split mirrors the CLI's `POR_PRIVATE_KEY` (reserves) vs `POR_OWNER_KEY` (owner).
 
 ## Optional — appear in the marketplace directory
 

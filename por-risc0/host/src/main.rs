@@ -344,9 +344,16 @@ fn resolve_secret_cli(owner_key: &Option<SigningKey>, token_id: u64) -> [u8; 32]
     }
 }
 
-/// Browser-side secret (`--finalize`): override, else derived from the wallet's identity
-/// signature, else zero (with a warning -- the proof still verifies but can't be recorded).
-fn resolve_secret_from_sig(identity_sig: Option<&str>) -> [u8; 32] {
+/// Browser-side secret (`--finalize`), highest precedence first: a per-request custom secret
+/// supplied in the UI (carried in sigs.json), then the `POR_AGENT_SECRET` env override, then
+/// derived from the wallet's identity signature, else zero (with a warning -- the proof still
+/// verifies but recordValidation won't match a commitment).
+fn resolve_secret_from_sig(custom_secret: Option<&str>, identity_sig: Option<&str>) -> [u8; 32] {
+    if let Some(h) = custom_secret.filter(|s| !s.trim().is_empty()) {
+        return hexb(h)
+            .try_into()
+            .expect("agent_secret (custom) must be 32-byte hex");
+    }
     if let Some(s) = secret_override() {
         return s;
     }
@@ -354,8 +361,8 @@ fn resolve_secret_from_sig(identity_sig: Option<&str>) -> [u8; 32] {
         Some(s) => por_types::secret_from_identity_sig(&hexb(s)),
         None => {
             eprintln!(
-                "WARNING: no identity signature and no POR_AGENT_SECRET -> zero identity binding; \
-                 the proof will verify but recordValidation on the marketplace will not match a commitment"
+                "WARNING: no identity signature, custom secret, or POR_AGENT_SECRET -> zero identity \
+                 binding; the proof will verify but recordValidation on the marketplace won't match a commitment"
             );
             [0u8; 32]
         }
@@ -694,7 +701,7 @@ async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: 
     // Per-agent marketplace binding: token id from the challenge agent_id, secret derived from
     // the wallet's identity signature (or POR_AGENT_SECRET override). The key never touches us.
     let token_id = resolve_token_id(&ch.agent_id);
-    let agent_secret = resolve_secret_from_sig(sv["identity_sig"].as_str());
+    let agent_secret = resolve_secret_from_sig(sv["agent_secret"].as_str(), sv["identity_sig"].as_str());
 
     let t_all = Instant::now();
     let mut bundles = Vec::with_capacity(blocks.len());

@@ -30,6 +30,9 @@
 //   GATEWAY               default 0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920 (V2 proxy)
 //   ATTESTATION           default 0x0807C544D38aE7729f8798388d89Be6502A1e8A8
 //   SUBMITTER_PORT        default 8092
+//   PIPELINE_DONE_TTL_MS  default 120000; how long a completed (VERIFIED) job stays in the live
+//                         pipeline panel before it's auto-evicted (FAILED jobs are left to the
+//                         explicit "Clear failed" action)
 //   POR_RESPONSE          optional path to a prover response.json to auto-submit on startup
 
 import http from 'node:http'
@@ -60,6 +63,11 @@ const DOMAIN_ID = BigInt(process.env.DOMAIN_ID || 2)
 const GATEWAY = (process.env.GATEWAY || '0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920')
 const ATTESTATION = (process.env.ATTESTATION || '0x0807C544D38aE7729f8798388d89Be6502A1e8A8')
 const PORT = Number(process.env.SUBMITTER_PORT || 8092)
+// How long a completed (VERIFIED) job lingers in the live pipeline before it's evicted. The
+// live panel is for in-flight work; once a job is recorded its receipt shows up in the directory
+// below, so keeping the card forever just clutters the UI (and grows this map unbounded). The
+// grace window is long enough that the user sees the ✓ "Recorded" state + the validation tx link.
+const DONE_TTL_MS = Number(process.env.PIPELINE_DONE_TTL_MS || 120_000)
 
 // risc0 versionHash candidates. zkVerify's statement uses VERSION_HASH = sha256("risc0:v<M>.<N>")
 // — SHA-256 (not keccak), colon format (not underscores). The Risc0Version enum is V2_1/V2_2/V2_3/V3_0,
@@ -186,10 +194,29 @@ let seq = 0
 const nowIso = () => new Date().toISOString()
 function upsert(jobId, patch) {
   const prev = jobs.get(jobId) || {}
-  jobs.set(jobId, { ...prev, ...patch, updatedAt: nowIso() })
-  return jobs.get(jobId)
+  const next = { ...prev, ...patch, updatedAt: nowIso() }
+  // Stamp the moment a job reaches its terminal success stage, so pruning is measured from
+  // completion rather than from any later touch (there shouldn't be one, but be defensive).
+  if (patch.stage === 'VERIFIED' && !prev.doneAt) next.doneAt = Date.now()
+  jobs.set(jobId, next)
+  return next
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Evict completed (VERIFIED) jobs once they've lingered past the grace window. FAILED jobs are
+// left to the explicit "Clear failed" action (a human may want to read the error); only the
+// happy-path "Recorded" cards auto-expire so the live panel doesn't grow forever.
+function pruneDone(now = Date.now()) {
+  let pruned = 0
+  for (const [id, j] of jobs) {
+    if (j.stage === 'VERIFIED' && j.doneAt && now - j.doneAt > DONE_TTL_MS) {
+      jobs.delete(id)
+      pruned++
+    }
+  }
+  if (pruned) console.log(`[submitter] pruned ${pruned} completed job(s) from the pipeline`)
+  return pruned
+}
 
 // Serialize on-chain sends across concurrently-running bundles. All bundles share ONE wallet,
 // so simultaneous writeContract calls grab the same nonce and all but one fail with
@@ -377,6 +404,7 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
   try {
     if (req.method === 'GET' && url.pathname === '/pipeline') {
+      pruneDone() // drop long-completed cards so the live panel doesn't stick forever
       return send(res, 200, { enabled: true, jobs: [...jobs.values()].sort((a, b) => (a.jobId < b.jobId ? 1 : -1)) })
     }
     if (req.method === 'GET' && url.pathname === '/health') {
@@ -411,3 +439,7 @@ http.createServer(async (req, res) => {
     } catch (e) { console.error(`[submitter] POR_RESPONSE load failed: ${e.message}`) }
   }
 })
+
+// Sweep completed jobs even when nobody is polling /pipeline, so the map stays bounded on a
+// long-lived process. unref() so this timer never keeps the process alive on its own.
+setInterval(() => pruneDone(), Math.max(15_000, Math.floor(DONE_TTL_MS / 2))).unref()
