@@ -1,0 +1,383 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Proof-of-Reserves Verifier API",
+    "version": "1.0.0",
+    "summary": "Interactive challenge/response API for privacy-preserving proof of native-coin reserves.",
+    "description": "An agent proves it controls one or more wallets whose **combined** native-coin balance is at least a threshold T, at three unpredictable finalized blocks, **without revealing balances, addresses, or the number of wallets**.\n\nFlow:\n1. `POST /v1/challenges` — ask for a challenge (the verifier picks a random nonce and 3 recent block numbers).\n2. Run the `prover` locally to produce a response (3 RISC Zero receipts + TLSNotary header attestations + an owner signature). Your key never touches this service.\n3. `POST /v1/challenges/{id}/response` — submit the response; get a verdict.\n4. `GET /v1/challenges/{id}` — poll state / verdict / settle progress.\n\nRegistration (`GET /v1/register`) and the human/agent guide are described here too. See also the machine-readable spec at `/v1/openapi.json` and the MCP server (`por-mcp.mjs`) for LLM-agent integration.",
+    "contact": { "name": "Proof-of-Reserves", "url": "https://ui-production-3e28.up.railway.app/docs" }
+  },
+  "servers": [
+    { "url": "https://verifier-production-d672.up.railway.app", "description": "Live verifier (testnet mode)" },
+    { "url": "http://127.0.0.1:7100", "description": "Local verifier" }
+  ],
+  "tags": [
+    { "name": "discovery", "description": "Machine-readable service metadata" },
+    { "name": "registration", "description": "How to register an agent so the verifier will authenticate it" },
+    { "name": "challenges", "description": "Issue, answer, and poll challenges" }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["discovery"],
+        "operationId": "getRoot",
+        "summary": "Service info",
+        "description": "Human/machine-readable service descriptor: version, endpoints, supported chains, notary hint, and links.",
+        "responses": {
+          "200": {
+            "description": "Service descriptor",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ServiceInfo" } } }
+          }
+        }
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "tags": ["discovery"],
+        "operationId": "getInfo",
+        "summary": "Service info (alias of `/`)",
+        "responses": {
+          "200": {
+            "description": "Service descriptor",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ServiceInfo" } } }
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": ["discovery"],
+        "operationId": "getOpenapi",
+        "summary": "This OpenAPI document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 spec for this service",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    },
+    "/v1/chains": {
+      "get": {
+        "tags": ["discovery"],
+        "operationId": "listChains",
+        "summary": "Supported chains",
+        "description": "The chains reserves can be proven on. `selector` is what you pass as `chain_id` when requesting a challenge; `resolved_chain_id` is the effective chain (in testnet mode a mainnet selector resolves to its paired testnet). The proof commits `resolved_chain_id`.",
+        "responses": {
+          "200": {
+            "description": "Supported chains for the current mode",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChainList" } } }
+          }
+        }
+      }
+    },
+    "/v1/register": {
+      "get": {
+        "tags": ["registration"],
+        "operationId": "getRegisterInfo",
+        "summary": "Registration info",
+        "description": "The verifier does not custody keys and cannot register on your behalf. Registration is a one-time on-chain `IdentityRegistry.register(agentURI)` transaction sent **from your own wallet** on Base Sepolia — `msg.sender` becomes the agent owner, and that owner is exactly what this verifier authenticates against (`ecrecover(owner_sig) == ownerOf(agentId)`). This endpoint returns everything you need to build that transaction (contract address, chain, ABI, calldata template, metadata template). The easiest ways to actually send it: the MCP `register_agent` tool, the `register-agent.mjs` helper, or a browser wallet on the `/prove` page's Register step.",
+        "responses": {
+          "200": {
+            "description": "How to register",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegisterInfo" } } }
+          }
+        }
+      }
+    },
+    "/v1/challenges": {
+      "post": {
+        "tags": ["challenges"],
+        "operationId": "createChallenge",
+        "summary": "Request a challenge",
+        "description": "Look up the agent's registered owner, draw a random nonce, pin the chain's finalized head, and derive 3 recent, unpredictable, finalized block numbers spread across a multi-day window. Returns the challenge to prove.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChallengeRequest" } } }
+        },
+        "responses": {
+          "201": {
+            "description": "Challenge issued",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Challenge" } } }
+          },
+          "400": {
+            "description": "Bad request (missing/invalid `agent_id`/`threshold`, or unsupported `chain_id` — body carries a `supported` list)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "Agent not found in the registry",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "502": {
+            "description": "Upstream failure (e.g. finalized-head fetch failed)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/v1/challenges/{id}/response": {
+      "post": {
+        "tags": ["challenges"],
+        "operationId": "submitResponse",
+        "summary": "Submit a response to a challenge",
+        "description": "Verify all 3 RISC Zero receipts + their TLSNotary bindings, cross-check they answer this challenge, authenticate the owner signature against the registry owner, and return a verdict. The body carries three ~0.5 MB CBOR receipts — stream it (`--data-binary @response.json`), do not inline it. A challenge can be answered once.",
+        "parameters": [ { "$ref": "#/components/parameters/ChallengeId" } ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Response" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict (verified or rejected). Note: a rejected verdict is still HTTP 200 with `verdict:\"rejected\"` and a `reason`.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Verdict" } } }
+          },
+          "400": {
+            "description": "Malformed response JSON",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "Unknown challenge id",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "Challenge already answered",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Verdict" } } }
+          },
+          "413": {
+            "description": "Body too large (> 8 MiB)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/v1/challenges/{id}": {
+      "get": {
+        "tags": ["challenges"],
+        "operationId": "getChallenge",
+        "summary": "Challenge state & verdict",
+        "description": "Current state, the verdict/reason once submitted, and — after a verified verdict when settle is enabled — the zkVerify/marketplace settle progress under `kurier`.",
+        "parameters": [ { "$ref": "#/components/parameters/ChallengeId" } ],
+        "responses": {
+          "200": {
+            "description": "Challenge status",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChallengeStatus" } } }
+          },
+          "404": {
+            "description": "Unknown challenge id",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "ChallengeId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The `challenge_id` returned by `POST /v1/challenges`.",
+        "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$", "example": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" }
+      }
+    },
+    "schemas": {
+      "ChallengeRequest": {
+        "type": "object",
+        "required": ["agent_id", "threshold"],
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "Marketplace agent id — the ERC-721 token id, hex (`0x16ec`) or decimal (`5868`). Must be registered.",
+            "example": "0x16ec"
+          },
+          "threshold": {
+            "description": "Minimum combined reserves in wei of the native coin. Decimal string, JSON number, or `0x`-hex string. u128 range.",
+            "oneOf": [ { "type": "string" }, { "type": "integer" } ],
+            "example": "50000000000000000"
+          },
+          "chain_id": {
+            "description": "Chain selector (default 1). See `GET /v1/chains`. In testnet mode a mainnet selector resolves to its paired testnet.",
+            "oneOf": [ { "type": "integer" }, { "type": "string" } ],
+            "default": 1,
+            "example": 1
+          }
+        }
+      },
+      "Challenge": {
+        "type": "object",
+        "description": "A verifier-issued challenge. Signed fields (nonce, agent, threshold, chain, block set) are bound by the owner signature.",
+        "required": ["challenge_id", "agent_id", "threshold", "chain_id", "nonce", "head_block", "blocks", "issued_at", "expires_at"],
+        "properties": {
+          "challenge_id": { "type": "string", "description": "32 hex chars.", "example": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" },
+          "agent_id": { "type": "string", "example": "0x16ec" },
+          "threshold": { "type": "string", "description": "wei, decimal or 0x-hex string.", "example": "50000000000000000" },
+          "chain_id": { "type": "integer", "description": "The resolved (effective) chain id, committed in each proof's journal.", "example": 11155111 },
+          "nonce": { "type": "string", "description": "0x-hex, 32 bytes.", "example": "0x9f...e2" },
+          "head_block": { "type": "integer", "format": "int64", "description": "Finalized head pinned at issue time." },
+          "blocks": {
+            "type": "array",
+            "description": "The 3 challenged block numbers, ascending.",
+            "items": { "type": "integer", "format": "int64" },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "issued_at": { "type": "integer", "format": "int64", "description": "Unix seconds." },
+          "expires_at": { "type": "integer", "format": "int64", "description": "Unix seconds — challenge expires ~1h after issue." }
+        }
+      },
+      "Response": {
+        "type": "object",
+        "description": "A prover's response: 3 self-contained proof bundles + the owner signature over the challenge. Produced by the `prover` locally.",
+        "required": ["version", "challenge", "owner_sig", "bundles"],
+        "properties": {
+          "version": { "type": "string", "const": "por-response-v1" },
+          "challenge": { "$ref": "#/components/schemas/Challenge" },
+          "owner_sig": { "type": "string", "description": "0x-hex, 65 bytes (r‖s‖v), EIP-191 over the challenge digest; must recover to the registry owner." },
+          "bundles": {
+            "type": "array",
+            "description": "Exactly 3 bundles, one per challenged block.",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": { "$ref": "#/components/schemas/Bundle" }
+          }
+        }
+      },
+      "Bundle": {
+        "type": "object",
+        "description": "A zkVerify/Kurier-shaped proof bundle for one block.",
+        "required": ["proofType", "proofOptions", "proofData"],
+        "properties": {
+          "proofType": { "type": "string", "const": "risc0" },
+          "proofOptions": {
+            "type": "object",
+            "properties": { "version": { "type": "string", "const": "V3_0" } }
+          },
+          "proofData": {
+            "type": "object",
+            "required": ["proof", "vk", "publicSignals"],
+            "properties": {
+              "proof": { "type": "string", "description": "0x-hex CBOR-encoded succinct receipt." },
+              "vk": { "type": "string", "description": "0x-hex image_id (little-endian words)." },
+              "publicSignals": { "type": "string", "description": "0x-hex guest journal bytes (block_hash, threshold, chain_id, debug, challenge_nonce, agent_id, block_number, …). No balance or address." }
+            }
+          },
+          "tlsnPresentation": { "type": "string", "description": "base64 TLSNotary header attestation. Required unless the verifier runs with POR_ALLOW_NO_PRESENTATION." }
+        }
+      },
+      "Verdict": {
+        "type": "object",
+        "required": ["challenge_id", "verdict"],
+        "properties": {
+          "challenge_id": { "type": "string" },
+          "verdict": { "type": "string", "enum": ["verified", "rejected"] },
+          "reason": { "type": "string", "description": "Present when rejected." }
+        }
+      },
+      "ChallengeStatus": {
+        "type": "object",
+        "properties": {
+          "challenge_id": { "type": "string" },
+          "state": { "type": "string", "enum": ["issued", "submitted", "verified", "rejected", "expired"] },
+          "agent_id": { "type": "string" },
+          "threshold": { "type": "string" },
+          "chain_id": { "type": "integer" },
+          "head_block": { "type": "integer", "format": "int64" },
+          "blocks": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "issued_at": { "type": "integer", "format": "int64" },
+          "expires_at": { "type": "integer", "format": "int64" },
+          "verdict": { "type": ["string", "null"], "enum": ["verified", "rejected", null] },
+          "reason": { "type": ["string", "null"] },
+          "kurier": {
+            "type": ["object", "null"],
+            "description": "zkVerify/marketplace settle progress (only when settle is enabled and the verdict is verified).",
+            "properties": {
+              "status": { "type": "string", "enum": ["pending", "settled", "failed"] },
+              "jobs": { "type": "array", "items": { "type": "object" } }
+            }
+          }
+        }
+      },
+      "ChainList": {
+        "type": "object",
+        "properties": {
+          "testnet": { "type": "boolean", "description": "Whether the service runs in testnet mode." },
+          "chains": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "selector": { "type": "integer", "description": "Pass this as `chain_id`.", "example": 1 },
+                "resolved_chain_id": { "type": "integer", "description": "Effective chain id committed in the proof.", "example": 11155111 },
+                "name": { "type": "string", "example": "Sepolia" },
+                "block_time_secs": { "type": "integer" },
+                "testnet": { "type": "boolean" },
+                "rpc_host": { "type": "string", "description": "The TLSNotary-attested header host bound to this chain." }
+              }
+            }
+          }
+        }
+      },
+      "ServiceInfo": {
+        "type": "object",
+        "properties": {
+          "service": { "type": "string", "const": "proof-of-reserves-verifier" },
+          "version": { "type": "string" },
+          "mode": { "type": "string", "enum": ["mainnet", "testnet"] },
+          "image_id": { "type": "string", "description": "The RISC Zero guest image_id the verifier accepts (0x-hex, LE words). Your prover must produce receipts under exactly this id." },
+          "block_count": { "type": "integer", "description": "Blocks challenged per session (3)." },
+          "window_days": { "type": "integer" },
+          "notary_hint": { "type": "string", "description": "Whether a TLSNotary presentation is required, and the suggested NOTARY_ADDR." },
+          "endpoints": { "type": "object", "additionalProperties": { "type": "string" } },
+          "chains": { "$ref": "#/components/schemas/ChainList" },
+          "links": {
+            "type": "object",
+            "properties": {
+              "guide": { "type": "string" },
+              "openapi": { "type": "string" },
+              "directory": { "type": "string" },
+              "marketplace": { "type": "string" }
+            }
+          }
+        }
+      },
+      "RegisterInfo": {
+        "type": "object",
+        "properties": {
+          "summary": { "type": "string" },
+          "self_custody": { "type": "boolean", "const": true },
+          "chain": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "const": "Base Sepolia" },
+              "chain_id": { "type": "integer", "const": 84532 },
+              "rpc_url": { "type": "string" }
+            }
+          },
+          "identity_registry": { "type": "string", "description": "ERC-721 AgentCards contract to call.", "example": "0x8004A818BFB912233c491871b3d84c89A494BD9e" },
+          "function": { "type": "string", "const": "register(string agentURI) returns (uint256 agentId)" },
+          "selector": { "type": "string", "description": "4-byte selector of register(string).", "example": "0xf2c298be" },
+          "metadata_template": { "type": "object", "description": "Recommended AgentCard metadata; base64-encode as a data: URI for agentURI." },
+          "tools": {
+            "type": "object",
+            "description": "The easiest ways to actually send the transaction.",
+            "properties": {
+              "mcp_tool": { "type": "string" },
+              "cli_helper": { "type": "string" },
+              "browser": { "type": "string" }
+            }
+          },
+          "note": { "type": "string", "description": "Why msg.sender must be the wallet you'll authorize challenges with." }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" },
+          "supported": { "type": "array", "items": { "type": "integer" }, "description": "On an unsupported chain_id, the selectors this service accepts." },
+          "testnet": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

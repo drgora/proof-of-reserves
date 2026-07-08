@@ -17,6 +17,9 @@ export default function App() {
           <Link className="header-link" to="/prove">
             Prove reserves
           </Link>
+          <Link className="header-link" to="/docs">
+            Agent guide &amp; API
+          </Link>
           <a
             className="header-link"
             href="https://agent-registry.horizenlabs.io"

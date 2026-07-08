@@ -400,6 +400,7 @@ export default function ProveReserves() {
             />
             <small>
               The agent must be registered; you'll authorize with its owner account. Not registered?{' '}
+              <Link to="/docs">Register it yourself</Link> or open the{' '}
               <a href="https://agent-registry.horizenlabs.io" target="_blank" rel="noreferrer">
                 Agent Marketplace ↗
               </a>

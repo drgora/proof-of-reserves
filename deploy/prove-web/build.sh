@@ -25,7 +25,9 @@ PROBE="$ROOT/por-risc0/target/release/notary_probe"
 [ -x "$PROBE" ] || { echo "building notary_probe ..."; ( cd "$ROOT/por-risc0" && cargo build --release --bin notary_probe ); }
 
 echo "Building frontend ..."
-( cd "$ROOT/app/web" && [ -d node_modules ] || npm install; npx vite build )
+# `npm run build` (not `npx vite build`) so the `prebuild` hook runs sync-docs.mjs, staging the
+# canonical AGENT_GUIDE.md + openapi.json into public/ (served at /docs and /openapi.json).
+( cd "$ROOT/app/web" && [ -d node_modules ] || npm install; npm run build )
 
 echo "Staging prover + r0vm + notary_probe + dist + backend ..."
 cp "$BIN" "$HERE/prover"

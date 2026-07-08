@@ -4,10 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "sync-docs": "node sync-docs.mjs",
+    "predev": "node sync-docs.mjs",
     "dev": "vite",
     "server": "node server.mjs",
+    "mcp": "node por-mcp.mjs",
     "mock": "node mock-registry.mjs",
     "server:mock": "REGISTRY_MCP_URL=http://127.0.0.1:8091/api/mcp PIPELINE_URL=http://127.0.0.1:8091/mock/pipeline POR_PROOF_TYPES=proof-of-reserves,risc0 CACHE_TTL_MS=3000 DIRECTORY_TTL_MS=3000 node server.mjs",
+    "prebuild": "node sync-docs.mjs",
     "build": "vite build",
     "preview": "vite preview"
   },

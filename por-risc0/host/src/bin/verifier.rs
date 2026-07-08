@@ -40,10 +40,26 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use host::verify::{self, Policy};
+use methods::POR_GUEST_ID;
 use por_types::{chain_spec, expected_host, resolve_chain, selectable_ids, Challenge, Response as PorResponse, BLOCK_COUNT};
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const TTL_SECONDS: u64 = 3600;
+
+/// Version reported by `GET /` and `GET /v1/info` (matches `openapi.json`'s `info.version`).
+const SERVICE_VERSION: &str = "1.0.0";
+/// The OpenAPI document, served verbatim at `GET /v1/openapi.json`. Single canonical copy in
+/// `host/src/openapi.json` (the web UI serves a build-synced copy of the same file).
+const OPENAPI_JSON: &str = include_str!("../openapi.json");
+/// Base Sepolia marketplace facts surfaced by `GET /v1/register`. The verifier never mints on an
+/// agent's behalf (it holds no keys); it only tells an agent how to self-register. See
+/// hl-registry-integration: registration is `IdentityRegistry.register(agentURI)` from the agent's
+/// own wallet, so `msg.sender` (== the wallet that signs challenges) becomes the ERC-721 owner.
+const IDENTITY_REGISTRY: &str = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
+const BASE_SEPOLIA_RPC: &str = "https://sepolia.base.org";
+const BASE_SEPOLIA_CHAIN_ID: u32 = 84532;
+/// Default public UI base (overridable with `POR_UI_URL`) — where the guide + directory live.
+const DEFAULT_UI_URL: &str = "https://ui-production-3e28.up.railway.app";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -319,12 +335,128 @@ fn verify_submission(
 
 // --- HTTP handlers ---
 
+// CORS: this API is called cross-origin by browser agents (the /prove page, third-party agent
+// UIs) and by machine clients that preflight, so every response advertises open access. It's a
+// read/challenge API with no cookies or ambient auth (agents authenticate with an owner signature
+// in the body), so `*` is safe here.
+fn with_cors(b: hyper::http::response::Builder) -> hyper::http::response::Builder {
+    b.header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, POST, OPTIONS")
+        .header("access-control-allow-headers", "content-type")
+        .header("access-control-max-age", "86400")
+}
+
 fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
+    with_cors(Response::builder().status(status).header("content-type", "application/json"))
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
+}
+
+// Serve a pre-serialized document (e.g. the embedded OpenAPI JSON) without a serde round-trip.
+fn raw_response(status: StatusCode, content_type: &str, body: &'static str) -> Response<Full<Bytes>> {
+    with_cors(Response::builder().status(status).header("content-type", content_type))
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+// CORS preflight — answered before the body is read.
+fn preflight_response() -> Response<Full<Bytes>> {
+    with_cors(Response::builder().status(StatusCode::NO_CONTENT))
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+/// The RISC Zero guest image_id the verifier accepts, as the same 0x-hex (LE u32 words) the
+/// prover stamps into each bundle's `vk`. A prover whose image_id differs is rejected, so
+/// surfacing it lets an agent confirm its build matches before spending minutes proving.
+fn image_id_hex() -> String {
+    format!(
+        "0x{}",
+        hex::encode(POR_GUEST_ID.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+    )
+}
+
+/// Supported chains for the current mode (machine-readable). `selector` is what a caller passes
+/// as `chain_id`; `resolved_chain_id` is the effective chain committed in the proof.
+fn chains_value(state: &AppState) -> Value {
+    let chains: Vec<Value> = selectable_ids(state.testnet)
+        .into_iter()
+        .filter_map(|sel| {
+            resolve_chain(sel, state.testnet).ok().map(|spec| {
+                json!({
+                    "selector": sel,
+                    "resolved_chain_id": spec.chain_id,
+                    "name": spec.name,
+                    "block_time_secs": spec.block_time_secs,
+                    "testnet": spec.testnet,
+                    "rpc_host": spec.rpc_host,
+                })
+            })
+        })
+        .collect();
+    json!({ "testnet": state.testnet, "chains": chains })
+}
+
+/// Service descriptor for `GET /` and `GET /v1/info`.
+fn service_info_value(state: &AppState) -> Value {
+    let ui = std::env::var("POR_UI_URL").unwrap_or_else(|_| DEFAULT_UI_URL.into());
+    let ui = ui.trim_end_matches('/');
+    json!({
+        "service": "proof-of-reserves-verifier",
+        "version": SERVICE_VERSION,
+        "mode": if state.testnet { "testnet" } else { "mainnet" },
+        "image_id": image_id_hex(),
+        "block_count": BLOCK_COUNT,
+        "window_days": state.window_days,
+        "notary_hint": if state.allow_no_presentation {
+            "TLSNotary presentation optional on this instance (dev mode)"
+        } else {
+            "TLSNotary presentation REQUIRED — set NOTARY_ADDR on your prover"
+        },
+        "endpoints": {
+            "request_challenge": "POST /v1/challenges",
+            "submit_response": "POST /v1/challenges/{id}/response",
+            "challenge_status": "GET /v1/challenges/{id}",
+            "chains": "GET /v1/chains",
+            "register_info": "GET /v1/register",
+            "openapi": "GET /v1/openapi.json"
+        },
+        "chains": chains_value(state),
+        "links": {
+            "guide": format!("{ui}/docs"),
+            "openapi": "/v1/openapi.json",
+            "directory": ui,
+            "marketplace": "https://agent-registry.horizenlabs.io"
+        }
+    })
+}
+
+/// How to self-register, for `GET /v1/register`. The verifier holds no keys and cannot register
+/// on the agent's behalf; it returns the exact on-chain call the agent makes itself.
+fn register_info_value() -> Value {
+    let selector = format!("0x{}", hex::encode(&verify::keccak256(b"register(string)")[..4]));
+    json!({
+        "summary": "Register once on Base Sepolia by calling IdentityRegistry.register(agentURI) from your OWN wallet. msg.sender becomes the agent owner — the wallet this verifier authenticates your challenge signatures against.",
+        "self_custody": true,
+        "chain": { "name": "Base Sepolia", "chain_id": BASE_SEPOLIA_CHAIN_ID, "rpc_url": BASE_SEPOLIA_RPC },
+        "identity_registry": IDENTITY_REGISTRY,
+        "function": "register(string agentURI) returns (uint256 agentId)",
+        "selector": selector,
+        "metadata_template": {
+            "name": "My Agent",
+            "description": "What my agent does",
+            "services": [{ "name": "proof-of-reserves", "endpoint": "https://example.com", "version": "0.1.0", "skills": ["proof-of-reserves"], "domains": ["defi"] }],
+            "supportedTrust": ["zkVerify-risc0"],
+            "metadata": { "proofSystem": "risc0" }
+        },
+        "agent_uri_hint": "data:application/json;base64,<base64 of JSON.stringify(metadata)>",
+        "tools": {
+            "mcp_tool": "register_agent (por-mcp.mjs)",
+            "cli_helper": "node app/web/register-agent.mjs --key 0x<owner key> --name \"My Agent\"",
+            "browser": "Open the /prove page and use the Register step (your wallet signs; needs Base Sepolia gas)"
+        },
+        "note": "The verifier authenticates you via ecrecover(owner_sig) == ownerOf(agentId). Because register() sets msg.sender as owner, register from the wallet whose key you will use as POR_OWNER_KEY (CLI) or authorize with in the browser."
+    })
 }
 
 fn handle_issue(state: &AppState, body: &[u8]) -> (StatusCode, Value) {
@@ -586,12 +718,27 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response<
     let path = req.uri().path().to_string();
     let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
 
+    // CORS preflight: answer before draining the body.
+    if method == Method::OPTIONS {
+        return Ok(preflight_response());
+    }
+
     let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, &json!({"error": "body too large"}))),
     };
 
+    // The OpenAPI doc is served verbatim (a static string), not via the Value tuple below.
+    if method == Method::GET && matches!(segs.as_slice(), ["v1", "openapi.json"]) {
+        return Ok(raw_response(StatusCode::OK, "application/json", OPENAPI_JSON));
+    }
+
     let (status, payload) = match (&method, segs.as_slice()) {
+        // Discovery (machine-readable service metadata).
+        (&Method::GET, []) | (&Method::GET, ["v1", "info"]) => (StatusCode::OK, service_info_value(&state)),
+        (&Method::GET, ["v1", "chains"]) => (StatusCode::OK, chains_value(&state)),
+        (&Method::GET, ["v1", "register"]) => (StatusCode::OK, register_info_value()),
+        // Challenge lifecycle.
         (&Method::POST, ["v1", "challenges"]) => handle_issue(&state, &body),
         (&Method::POST, ["v1", "challenges", id, "response"]) => handle_submit(&state, id, &body).await,
         (&Method::GET, ["v1", "challenges", id]) => handle_status(&state, id),

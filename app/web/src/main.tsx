@@ -9,6 +9,7 @@ import App from './App'
 import Directory from './pages/Directory'
 import AgentDetail from './pages/AgentDetail'
 import ProveReserves from './pages/ProveReserves'
+import Docs from './pages/Docs'
 import './theme.css'
 
 const queryClient = new QueryClient({
@@ -36,6 +37,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Directory /> },
       { path: 'prove', element: <ProveReserves /> },
+      { path: 'docs', element: <Docs /> },
       { path: 'agent/:agentId', element: <AgentDetail /> },
     ],
   },
