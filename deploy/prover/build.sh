@@ -5,8 +5,9 @@
 #   PUSH=1 deploy/prover/build.sh       # also docker push (needs `docker login ghcr.io`)
 #
 # It stages the prebuilt prover binary next to the Dockerfile, then builds. The binary
-# MUST be built reproducibly so its guest image_id equals the deployed verifier's
-# (0x4f02b5a5888cd107681e44eef9b9c3eaa836d18b4f15a9d10a741bff704039e6):
+# MUST be built reproducibly so its guest image_id equals the deployed verifier's + the
+# marketplace-registered vkHash
+# (0xd78517f8ad9d6816218dc3fc10a1980cbe2b801471bd62a5a1848e87e45750b0, multi-wallet guest):
 #
 #   cd por-risc0 && RISC0_USE_DOCKER=1 cargo build --release --bin prover
 #
@@ -18,7 +19,7 @@ HERE="$ROOT/deploy/prover"
 GHCR_OWNER="${GHCR_OWNER:-drgora}"
 IMAGE="${PROVER_IMAGE:-ghcr.io/$GHCR_OWNER/por-prover:latest}"
 BIN="$ROOT/por-risc0/target/release/prover"
-EXPECTED_ID="0x4f02b5a5888cd107681e44eef9b9c3eaa836d18b4f15a9d10a741bff704039e6"
+EXPECTED_ID="0xd78517f8ad9d6816218dc3fc10a1980cbe2b801471bd62a5a1848e87e45750b0"
 
 [ -x "$BIN" ] || { echo "ERROR: prover binary not found at $BIN"; echo "build it: (cd por-risc0 && RISC0_USE_DOCKER=1 cargo build --release --bin prover)"; exit 1; }
 

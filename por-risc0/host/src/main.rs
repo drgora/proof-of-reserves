@@ -107,38 +107,122 @@ fn http_get(url: &str) -> Value {
     serde_json::from_slice(&out).unwrap_or(Value::Null)
 }
 
-// Witness for a single block (the private guest inputs, minus the ownership sig).
-struct BlockInputs {
-    header_rlp: Vec<u8>,
-    account_proof: Vec<Vec<u8>>,
+// Private per-wallet state for one block (minus the ownership sig, produced separately).
+struct WalletWitness {
     address: [u8; 20],
     nonce: u64,
     balance: u128,
     storage_hash: [u8; 32],
     code_hash: [u8; 32],
+    account_proof: Vec<Vec<u8>>,
 }
 
-// Fetch the raw header + account proof for `addr_hex` at `block_hex` (a hex block number).
-// The header (debug_getRawHeader, needs no state) comes from `header_url` (the canonical drpc
-// host that the attestation also uses); the account proof (eth_getProof, needs ARCHIVE state
-// for the multi-day window) comes from `proof_url`, which may be a different archive endpoint.
-fn fetch_block(block_hex: &str, addr_hex: &str, header_url: &str, proof_url: &str) -> BlockInputs {
+// Witness for a single block: the shared header + one or more wallets proven against it.
+struct BlockInputs {
+    header_rlp: Vec<u8>,
+    wallets: Vec<WalletWitness>,
+}
+
+impl BlockInputs {
+    // Combined balance across all wallets (saturating: the in-circuit sum uses U256 and is
+    // authoritative, this is only the pre-flight check).
+    fn total_balance(&self) -> u128 {
+        self.wallets.iter().fold(0u128, |a, w| a.saturating_add(w.balance))
+    }
+}
+
+// A set of reserves wallets to prove in one shot. `addrs` is sorted ascending + distinct (the
+// order the guest requires so a wallet can't be double-counted). In OWNERSHIP mode `keys` is
+// aligned 1:1 with `addrs` (each key signs its wallet); in DEMO mode `keys` is empty and
+// `debug` is true (ownership skipped).
+struct WalletSet {
+    addrs: Vec<[u8; 20]>,
+    keys: Vec<SigningKey>,
+    debug: bool,
+}
+
+fn parse_addr20(s: &str) -> [u8; 20] {
+    let v = hexb(s);
+    assert_eq!(v.len(), 20, "address must be 20 bytes, got {}: {s}", v.len());
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&v);
+    a
+}
+
+fn addr_of_key(sk: &SigningKey) -> [u8; 20] {
+    let enc = sk.verifying_key().to_encoded_point(false);
+    keccak256(&enc.as_bytes()[1..65])[12..32].try_into().unwrap()
+}
+
+// Build the reserves-wallet set for connected/file/legacy modes. `POR_PRIVATE_KEY` may be a
+// COMMA-SEPARATED list of 32-byte keys (OWNERSHIP: the combined balance of their EOAs is
+// proven); unset => DEMO (comma-separated `POR_DEMO_ADDR`, else the default beacon contract).
+// Wallets are sorted ascending + de-duplicated to match the guest's distinct/ascending rule.
+fn build_wallet_set() -> WalletSet {
+    if let Ok(env) = std::env::var("POR_PRIVATE_KEY") {
+        let mut pairs: Vec<([u8; 20], SigningKey)> = env
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(|k| {
+                let sk = SigningKey::from_slice(&hexb(k))
+                    .expect("POR_PRIVATE_KEY entries must be 32-byte hex");
+                (addr_of_key(&sk), sk)
+            })
+            .collect();
+        assert!(!pairs.is_empty(), "POR_PRIVATE_KEY set but contained no keys");
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        for w in pairs.windows(2) {
+            assert_ne!(w[0].0, w[1].0, "duplicate wallet 0x{} in POR_PRIVATE_KEY", hex::encode(w[0].0));
+        }
+        let (addrs, keys): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        WalletSet { addrs, keys, debug: false }
+    } else {
+        let raw = std::env::var("POR_DEMO_ADDR").unwrap_or_else(|_| ADDR.to_string());
+        let mut addrs: Vec<[u8; 20]> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(parse_addr20)
+            .collect();
+        assert!(!addrs.is_empty(), "no DEMO address");
+        addrs.sort();
+        addrs.dedup();
+        WalletSet { addrs, keys: Vec::new(), debug: true }
+    }
+}
+
+impl WalletSet {
+    fn addr_hexes(&self) -> Vec<String> {
+        self.addrs.iter().map(|a| format!("0x{}", hex::encode(a))).collect()
+    }
+}
+
+// Fetch the raw header once + one account proof per address at `block_hex`. The header
+// (debug_getRawHeader, needs no state) comes from `header_url` (the canonical drpc host that
+// the attestation also uses); each account proof (eth_getProof, needs ARCHIVE state for the
+// multi-day window) comes from `proof_url`, which may be a different archive endpoint.
+fn fetch_block(block_hex: &str, addrs: &[[u8; 20]], header_url: &str, proof_url: &str) -> BlockInputs {
     let header_rlp = hexb(rpc("debug_getRawHeader", serde_json::json!([block_hex]), header_url).as_str().unwrap());
-    let proof = rpc("eth_getProof", serde_json::json!([addr_hex, Vec::<String>::new(), block_hex]), proof_url);
-    let nonce = u64::from_str_radix(proof["nonce"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
-    let balance = hu128(proof["balance"].as_str().unwrap());
-    let storage_hash = h32(proof["storageHash"].as_str().unwrap());
-    let code_hash = h32(proof["codeHash"].as_str().unwrap());
-    let account_proof: Vec<Vec<u8>> = proof["accountProof"].as_array().unwrap()
-        .iter().map(|n| hexb(n.as_str().unwrap())).collect();
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&hexb(addr_hex));
-    BlockInputs { header_rlp, account_proof, address, nonce, balance, storage_hash, code_hash }
+    let wallets = addrs
+        .iter()
+        .map(|a| {
+            let addr_hex = format!("0x{}", hex::encode(a));
+            let proof = rpc("eth_getProof", serde_json::json!([addr_hex, Vec::<String>::new(), block_hex]), proof_url);
+            let nonce = u64::from_str_radix(proof["nonce"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+            let balance = hu128(proof["balance"].as_str().unwrap());
+            let storage_hash = h32(proof["storageHash"].as_str().unwrap());
+            let code_hash = h32(proof["codeHash"].as_str().unwrap());
+            let account_proof: Vec<Vec<u8>> = proof["accountProof"].as_array().unwrap()
+                .iter().map(|n| hexb(n.as_str().unwrap())).collect();
+            WalletWitness { address: *a, nonce, balance, storage_hash, code_hash, account_proof }
+        })
+        .collect();
+    BlockInputs { header_rlp, wallets }
 }
 
-// Ownership signature over EIP-191(block_hash) with the wallet key (empty when debug/no key).
-fn wallet_sig(header_rlp: &[u8], key: &Option<SigningKey>) -> Vec<u8> {
-    let Some(sk) = key else { return Vec::new() };
+// Ownership signature over EIP-191(block_hash) with one wallet key.
+fn sign_block(header_rlp: &[u8], sk: &SigningKey) -> Vec<u8> {
     let block_hash = keccak256(header_rlp);
     let mut msg = Vec::with_capacity(60);
     msg.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
@@ -150,33 +234,44 @@ fn wallet_sig(header_rlp: &[u8], key: &Option<SigningKey>) -> Vec<u8> {
     v
 }
 
-// Refuse impossible proofs cleanly, before the (slow) attestation + proving. A wallet that
-// can't meet the threshold -- including one that doesn't exist (balance 0, an MPT *exclusion*
-// proof) -- makes the guest correctly refuse; without this that surfaces as an ugly panic +
-// backtrace through prove()'s unwrap. Exit with a clear message instead.
-fn ensure_can_prove(balance: u128, threshold: u128, debug: bool) {
-    if !debug && balance < threshold {
+// One ownership signature per wallet, aligned with `ws.addrs`. Empty sigs in DEMO mode (the
+// guest reads a sig per wallet but ignores it when debug=true).
+fn block_sigs(header_rlp: &[u8], ws: &WalletSet) -> Vec<Vec<u8>> {
+    if ws.debug {
+        return vec![Vec::new(); ws.addrs.len()];
+    }
+    ws.keys.iter().map(|sk| sign_block(header_rlp, sk)).collect()
+}
+
+// Refuse impossible proofs cleanly, before the (slow) attestation + proving. If the wallets'
+// COMBINED balance can't meet the threshold -- including accounts that don't exist (balance 0,
+// MPT *exclusion* proofs) -- the guest correctly refuses; without this that surfaces as an ugly
+// panic + backtrace through prove()'s unwrap. Exit with a clear message instead.
+fn ensure_can_prove(total: u128, threshold: u128, debug: bool, n_wallets: usize) {
+    if !debug && total < threshold {
         eprintln!(
-            "\ncannot prove reserves: balance {balance} wei < threshold {threshold} wei{}",
-            if balance == 0 {
-                " (the account does not exist / holds nothing at this block)"
+            "\ncannot prove reserves: combined balance {total} wei across {n_wallets} wallet(s) < threshold {threshold} wei{}",
+            if total == 0 {
+                " (the accounts do not exist / hold nothing at this block)"
             } else {
                 ""
             }
         );
         eprintln!(
-            "hint: use a wallet funded above the threshold across the whole challenge window, \
-             or run DEMO mode (unset POR_PRIVATE_KEY)."
+            "hint: include wallets whose COMBINED native balance stays above the threshold across \
+             the whole challenge window, or run DEMO mode (unset POR_PRIVATE_KEY)."
         );
         std::process::exit(1);
     }
 }
 
 // Prove one block -> a proof.json-shaped bundle (optionally carrying a TLSNotary presentation).
+// `sigs` is one ownership signature per wallet, aligned with `inputs.wallets` (empty entries
+// in demo mode).
 #[allow(clippy::too_many_arguments)]
 fn prove_block(
     inputs: &BlockInputs,
-    sig: &[u8],
+    sigs: &[Vec<u8>],
     threshold: u128,
     chain_id: u32,
     debug: bool,
@@ -190,27 +285,33 @@ fn prove_block(
     seg_po2: u32,
     presentation_b64: Option<String>,
 ) -> Value {
-    let env = ExecutorEnv::builder()
-        .segment_limit_po2(seg_po2)
-        .write(&inputs.header_rlp).unwrap()
-        .write(&inputs.account_proof).unwrap()
-        .write(&inputs.address).unwrap()
-        .write(&inputs.nonce).unwrap()
-        .write(&inputs.balance).unwrap()
-        .write(&inputs.storage_hash).unwrap()
-        .write(&inputs.code_hash).unwrap()
-        .write(&sig.to_vec()).unwrap() // ownership sig (empty in demo mode)
-        .write(&threshold).unwrap()
-        .write(&chain_id).unwrap()
-        .write(&debug).unwrap()
-        .write(challenge_nonce).unwrap()
-        .write(agent_id).unwrap()
-        .write(&agent_token_id).unwrap() // marketplace ERC-721 token id
-        .write(agent_secret).unwrap()    // private agent secret (identity binding)
-        .build().unwrap();
+    assert_eq!(sigs.len(), inputs.wallets.len(), "sig count {} != wallet count {}", sigs.len(), inputs.wallets.len());
+    // The guest reads: header, n_wallets, then per wallet {address, nonce, balance,
+    // storage_hash, code_hash, account_proof, sig}, then the public fields.
+    let mut builder = ExecutorEnv::builder();
+    builder.segment_limit_po2(seg_po2);
+    builder.write(&inputs.header_rlp).unwrap();
+    builder.write(&(inputs.wallets.len() as u32)).unwrap();
+    for (w, sig) in inputs.wallets.iter().zip(sigs) {
+        builder.write(&w.address).unwrap();
+        builder.write(&w.nonce).unwrap();
+        builder.write(&w.balance).unwrap();
+        builder.write(&w.storage_hash).unwrap();
+        builder.write(&w.code_hash).unwrap();
+        builder.write(&w.account_proof).unwrap();
+        builder.write(sig).unwrap(); // ownership sig (empty in demo mode)
+    }
+    builder.write(&threshold).unwrap();
+    builder.write(&chain_id).unwrap();
+    builder.write(&debug).unwrap();
+    builder.write(challenge_nonce).unwrap();
+    builder.write(agent_id).unwrap();
+    builder.write(&agent_token_id).unwrap(); // marketplace ERC-721 token id
+    builder.write(agent_secret).unwrap(); // private agent secret (identity binding)
+    let env = builder.build().unwrap();
 
     let t = Instant::now();
-    // Backstop: if the guest still refuses here (e.g. balance below threshold, or an
+    // Backstop: if the guest still refuses here (e.g. combined balance below threshold, or an
     // absent-account MPT exclusion proof), exit cleanly instead of unwrapping into a panic.
     let receipt = match default_prover().prove_with_opts(env, POR_GUEST_ELF, &ProverOpts::succinct()) {
         Ok(info) => info.receipt,
@@ -222,12 +323,15 @@ fn prove_block(
     receipt.verify(POR_GUEST_ID).unwrap();
 
     let j = &receipt.journal.bytes;
-    // balance==0 serializes to zero bytes that also appear legitimately -> only a NONZERO
-    // balance showing up is a real leak.
-    let bal_leaked = inputs.balance != 0 && j.windows(16).any(|w| w == inputs.balance.to_le_bytes());
-    let addr_leaked = j.windows(20).any(|w| w == inputs.address);
-    assert!(!bal_leaked && !addr_leaked, "PRIVACY FAILURE");
-    println!("    proved in {:?}; journal {} bytes; balance leaked? {bal_leaked}; address leaked? {addr_leaked}", t.elapsed(), j.len());
+    // Privacy: no wallet's address, and no wallet's NONZERO balance, may appear in the journal.
+    // (balance==0 serializes to zero bytes that also appear legitimately -> only a NONZERO
+    // balance showing up is a real leak.)
+    let leaked = inputs.wallets.iter().any(|w| {
+        (w.balance != 0 && j.windows(16).any(|x| x == w.balance.to_le_bytes()))
+            || j.windows(20).any(|x| x == w.address)
+    });
+    assert!(!leaked, "PRIVACY FAILURE");
+    println!("    proved in {:?}; journal {} bytes; {} wallet(s); addr+balance hidden", t.elapsed(), j.len(), inputs.wallets.len());
 
     let mut cbor = Vec::new();
     ciborium::into_writer(&receipt, &mut cbor).unwrap();
@@ -369,9 +473,14 @@ fn resolve_secret_from_sig(custom_secret: Option<&str>, identity_sig: Option<&st
     }
 }
 
-// Sign the challenge digest with the owner EOA (POR_OWNER_KEY, falling back to POR_PRIVATE_KEY).
+// Sign the challenge digest with the owner EOA (POR_OWNER_KEY, falling back to the FIRST
+// POR_PRIVATE_KEY entry -- the reserves-wallet key list is comma-separated).
 fn owner_sign(ch: &Challenge) -> Option<String> {
-    let key = std::env::var("POR_OWNER_KEY").ok().or_else(|| std::env::var("POR_PRIVATE_KEY").ok())?;
+    let key = std::env::var("POR_OWNER_KEY").ok().or_else(|| {
+        std::env::var("POR_PRIVATE_KEY")
+            .ok()
+            .and_then(|s| s.split(',').map(str::trim).find(|k| !k.is_empty()).map(String::from))
+    })?;
     let sk = SigningKey::from_slice(&hexb(&key)).expect("owner key must be 32-byte hex");
     let digest = ch.challenge_digest().expect("challenge digest");
     let (s, recid) = sk.sign_prehash_recoverable(&digest).unwrap();
@@ -386,22 +495,6 @@ async fn main() {
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
 
-    // Wallet key: set => OWNERSHIP (derive the EOA, debug=false); unset => DEMO (beacon, debug=true).
-    let owner_key: Option<SigningKey> = std::env::var("POR_PRIVATE_KEY").ok().map(|k| {
-        SigningKey::from_slice(&hexb(&k)).expect("POR_PRIVATE_KEY must be 32-byte hex")
-    });
-    let addr_hex: String = match &owner_key {
-        Some(sk) => {
-            let enc = sk.verifying_key().to_encoded_point(false);
-            let a: [u8; 20] = keccak256(&enc.as_bytes()[1..65])[12..32].try_into().unwrap();
-            format!("0x{}", hex::encode(a))
-        }
-        // DEMO (no key): a funded contract to prove against. Default is the mainnet beacon
-        // deposit contract; override per chain with POR_DEMO_ADDR (the default holds nothing
-        // off mainnet, so the guest would correctly refuse the threshold there).
-        None => std::env::var("POR_DEMO_ADDR").unwrap_or_else(|_| ADDR.to_string()),
-    };
-    let debug = owner_key.is_none();
     // Which chain to prove on. In challenge/connected modes the verifier's challenge is
     // authoritative (ch.chain_id -- and the verifier applies POR_TESTNET when it resolves the
     // selector we send). This is the connected request's SELECTOR and the legacy chain. Default 1.
@@ -413,15 +506,16 @@ async fn main() {
     let testnet = std::env::var("POR_TESTNET").is_ok();
     let seg_po2: u32 = std::env::var("POR_SEGMENT_PO2").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
 
-    // Browser-wallet mode (the private key never touches the prover). Two phases:
-    //   --prepare  --challenge <ch> --address <0x..> [--out prepare.json]
+    // Browser-wallet mode (the private keys never touch the prover). Two phases:
+    //   --prepare  --challenge <ch> --address <0x..>[,0x..] [--out prepare.json]
     //   --finalize --prepared prepare.json --sigs sigs.json [--out response.json]
-    // The wallet signs the messages listed in prepare.json between the two calls.
+    // The wallet(s) sign the messages listed in prepare.json between the two calls. `--address`
+    // may be a comma-separated list -> the combined balance of those wallets is proven.
     if std::env::args().any(|a| a == "--prepare") {
         let ch = load_challenge().expect("--prepare requires --challenge <file> (or POR_CHALLENGE)");
-        let address = arg_value("--address").expect("--prepare requires --address <0x..>");
+        let addresses = arg_value("--address").expect("--prepare requires --address <0x..>[,0x..]");
         let out = arg_value("--out").unwrap_or_else(|| "prepare.json".into());
-        run_prepare(ch, &address, &out).await;
+        run_prepare(ch, &addresses, &out).await;
         return;
     }
     if std::env::args().any(|a| a == "--finalize") {
@@ -432,17 +526,29 @@ async fn main() {
         return;
     }
 
+    // Reserves wallets to prove: comma-separated POR_PRIVATE_KEY => OWNERSHIP (combined balance
+    // of the EOAs, debug=false); unset => DEMO (POR_DEMO_ADDR list / beacon, debug=true).
+    let wallets = build_wallet_set();
+    // Owner/identity fallback key = the first reserves key (POR_OWNER_KEY still overrides).
+    let first_key: Option<SigningKey> = wallets.keys.first().cloned();
+    println!(
+        "reserves wallets ({}): {} [{}]",
+        wallets.addrs.len(),
+        if wallets.debug { "DEMO" } else { "OWNERSHIP" },
+        wallets.addr_hexes().join(", ")
+    );
+
     match connected_target() {
         // Connected: request challenge -> prove -> submit -> verdict, against a live verifier.
         // We send the raw selector; the verifier (its POR_TESTNET) resolves it to the effective chain.
         Some((url, agent_id, threshold)) => {
-            run_connected(url, agent_id, threshold, req_chain_id, &owner_key, &addr_hex, debug, seg_po2).await
+            run_connected(url, agent_id, threshold, req_chain_id, &wallets, &first_key, seg_po2).await
         }
         None => match load_challenge() {
             // File: prove a challenge from --challenge/POR_CHALLENGE -> response.json.
-            Some(ch) => run_challenge(ch, &owner_key, &addr_hex, debug, seg_po2).await,
+            Some(ch) => run_challenge(ch, &wallets, &first_key, seg_po2).await,
             // Legacy: single finalized block -> proof.json.
-            None => run_legacy_single(req_chain_id, testnet, &owner_key, &addr_hex, debug, seg_po2).await,
+            None => run_legacy_single(req_chain_id, testnet, &wallets, &first_key, seg_po2).await,
         },
     }
 }
@@ -451,11 +557,11 @@ async fn main() {
 // the verifier's (ch.chain_id) -- the prover proves whatever chain the challenge pinned.
 async fn prove_challenge(
     ch: Challenge,
-    owner_key: &Option<SigningKey>,
-    addr_hex: &str,
-    debug: bool,
+    ws: &WalletSet,
+    first_key: &Option<SigningKey>,
     seg_po2: u32,
 ) -> Response {
+    let debug = ws.debug;
     let chain_id = ch.chain_id;
     let spec = chain_spec(chain_id)
         .unwrap_or_else(|| panic!("challenge names unsupported chain_id {chain_id}"));
@@ -466,26 +572,27 @@ async fn prove_challenge(
     let agent_id = ch.agent_id_hash();
     let mode = if debug { "DEMO (debug=true)" } else { "OWNERSHIP (debug=false)" };
     println!(
-        "challenge {}: agent {}, chain {}({chain_id}), threshold {} (native), blocks {:?}, mode {mode}, wallet {addr_hex}",
-        ch.challenge_id, ch.agent_id, spec.name, threshold as f64 / 1e18, ch.blocks
+        "challenge {}: agent {}, chain {}({chain_id}), threshold {} (native), blocks {:?}, mode {mode}, {} wallet(s) {}",
+        ch.challenge_id, ch.agent_id, spec.name, threshold as f64 / 1e18, ch.blocks,
+        ws.addrs.len(), ws.addr_hexes().join(",")
     );
     println!("  header <- {header_url}   proof <- {proof_url}");
 
     // Per-agent marketplace binding (identical across the 3 blocks). Inert in DEMO (no key):
     // a demo run shouldn't bind a real agent's commitment, so token id + secret stay 0.
     let token_id = if debug { 0 } else { resolve_token_id(&ch.agent_id) };
-    let agent_secret = if debug { [0u8; 32] } else { resolve_secret_cli(owner_key, token_id) };
+    let agent_secret = if debug { [0u8; 32] } else { resolve_secret_cli(first_key, token_id) };
 
     let mut bundles = Vec::with_capacity(ch.blocks.len());
     let t_all = Instant::now();
     for (i, &blk) in ch.blocks.iter().enumerate() {
         let block_hex = format!("0x{blk:x}");
         println!("[block {}/{}] {block_hex} (#{blk})", i + 1, ch.blocks.len());
-        let inputs = fetch_block(&block_hex, addr_hex, &header_url, &proof_url);
-        ensure_can_prove(inputs.balance, threshold, debug);
-        let sig = wallet_sig(&inputs.header_rlp, owner_key);
+        let inputs = fetch_block(&block_hex, &ws.addrs, &header_url, &proof_url);
+        ensure_can_prove(inputs.total_balance(), threshold, debug, ws.addrs.len());
+        let sigs = block_sigs(&inputs.header_rlp, ws);
         let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
-        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
+        let bundle = prove_block(&inputs, &sigs, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
         bundles.push(bundle);
     }
 
@@ -499,14 +606,8 @@ async fn prove_challenge(
 }
 
 // File mode (`--challenge <file>`): prove and write response.json.
-async fn run_challenge(
-    ch: Challenge,
-    owner_key: &Option<SigningKey>,
-    addr_hex: &str,
-    debug: bool,
-    seg_po2: u32,
-) {
-    let response = prove_challenge(ch, owner_key, addr_hex, debug, seg_po2).await;
+async fn run_challenge(ch: Challenge, ws: &WalletSet, first_key: &Option<SigningKey>, seg_po2: u32) {
+    let response = prove_challenge(ch, ws, first_key, seg_po2).await;
     let out = arg_value("--out").unwrap_or_else(|| "response.json".into());
     File::create(&out).unwrap()
         .write_all(serde_json::to_string_pretty(&response).unwrap().as_bytes()).unwrap();
@@ -520,9 +621,8 @@ async fn run_connected(
     agent_id: String,
     threshold: String,
     req_chain_id: u32,
-    owner_key: &Option<SigningKey>,
-    addr_hex: &str,
-    debug: bool,
+    ws: &WalletSet,
+    first_key: &Option<SigningKey>,
     seg_po2: u32,
 ) {
     let base = verifier_url.trim_end_matches('/').to_string();
@@ -536,7 +636,7 @@ async fn run_connected(
     let ch: Challenge = serde_json::from_value(raw).expect("parse challenge from verifier");
     let cid = ch.challenge_id.clone();
 
-    let response = prove_challenge(ch, owner_key, addr_hex, debug, seg_po2).await;
+    let response = prove_challenge(ch, ws, first_key, seg_po2).await;
     if let Some(out) = arg_value("--out") {
         File::create(&out).unwrap()
             .write_all(serde_json::to_string_pretty(&response).unwrap().as_bytes()).unwrap();
@@ -564,11 +664,11 @@ async fn run_connected(
 async fn run_legacy_single(
     selector: u32,
     testnet: bool,
-    owner_key: &Option<SigningKey>,
-    addr_hex: &str,
-    debug: bool,
+    ws: &WalletSet,
+    first_key: &Option<SigningKey>,
     seg_po2: u32,
 ) {
+    let debug = ws.debug;
     // Resolve the selector under POR_TESTNET (mainnet id -> its paired testnet); the effective
     // real chain_id is what gets fetched, attested, and committed.
     let spec = resolve_chain(selector, testnet).unwrap_or_else(|e| panic!("{e}"));
@@ -582,23 +682,23 @@ async fn run_legacy_single(
     let threshold: u128 = std::env::var("POR_THRESHOLD").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(1_000_000_000_000_000_000); // 1 ETH
 
-    let inputs = fetch_block(&block_hex, addr_hex, &header_url, &proof_url);
+    let inputs = fetch_block(&block_hex, &ws.addrs, &header_url, &proof_url);
     let mode = if debug { "DEMO (debug=true, ownership skipped)" } else { "OWNERSHIP (debug=false)" };
     println!(
-        "legacy single-block mode: {mode}\nchain {}({chain_id}), address {addr_hex}, block {block_num}, depth {}, balance {} (native), threshold {}",
-        spec.name, inputs.account_proof.len(), inputs.balance as f64 / 1e18, threshold as f64 / 1e18
+        "legacy single-block mode: {mode}\nchain {}({chain_id}), {} wallet(s) {}, block {block_num}, combined balance {} (native), threshold {}",
+        spec.name, ws.addrs.len(), ws.addr_hexes().join(","), inputs.total_balance() as f64 / 1e18, threshold as f64 / 1e18
     );
-    ensure_can_prove(inputs.balance, threshold, debug);
+    ensure_can_prove(inputs.total_balance(), threshold, debug, ws.addrs.len());
 
-    let sig = wallet_sig(&inputs.header_rlp, owner_key);
+    let sigs = block_sigs(&inputs.header_rlp, ws);
     // No challenge in legacy mode -> placeholder journal labels. Marketplace binding comes only
     // from explicit env overrides here (legacy has no marketplace agent id to derive from).
     let challenge_nonce = [0u8; 32];
     let agent_id: [u8; 32] = keccak256(b"por-demo-agent").into();
     let token_id = resolve_token_id("");
-    let agent_secret = resolve_secret_cli(owner_key, token_id);
+    let agent_secret = resolve_secret_cli(first_key, token_id);
     let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
-    let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
+    let bundle = prove_block(&inputs, &sigs, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
 
     File::create("proof.json").unwrap()
         .write_all(serde_json::to_string_pretty(&bundle).unwrap().as_bytes()).unwrap();
@@ -609,49 +709,64 @@ async fn run_legacy_single(
 //     so the wallet's private key never touches the prover -- the browser signs the messages
 //     emitted by `--prepare` and hands them back to `--finalize`. Always OWNERSHIP (debug=false).
 
-// PHASE 1: fetch the account proof + raw header for `address_hex` at each challenged block,
-// check balance >= T, and write prepare.json -- the witnesses plus the exact 32-byte EIP-191
-// messages the wallet must personal_sign (each block_hash + the challenge prehash). No key,
-// no proving. The messages are derived here (in Rust, from por-types) so the canonical
-// challenge serialization stays single-source and can't drift in the browser.
-async fn run_prepare(ch: Challenge, address_hex: &str, out: &str) {
+// PHASE 1: fetch the account proof + raw header for each wallet in `addresses_csv` (a comma-
+// separated list) at each challenged block, check the COMBINED balance >= T, and write
+// prepare.json -- the per-wallet witnesses plus the exact 32-byte EIP-191 messages the wallet(s)
+// must personal_sign (each block_hash + the challenge prehash). No key, no proving. The messages
+// are derived here (in Rust, from por-types) so the canonical challenge serialization stays
+// single-source and can't drift in the browser. Wallets are sorted ascending + de-duplicated to
+// match the guest's distinct/ascending rule; `block_sigs` in phase 2 must follow that order.
+async fn run_prepare(ch: Challenge, addresses_csv: &str, out: &str) {
     let chain_id = ch.chain_id;
     let spec = chain_spec(chain_id).unwrap_or_else(|| panic!("challenge names unsupported chain_id {chain_id}"));
     let header_url = verify::header_rpc_url(chain_id).expect("header rpc url");
     let proof_url = verify::proof_rpc_url(chain_id).expect("proof rpc url");
     let threshold = ch.threshold_u128().expect("challenge threshold");
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&hexb(address_hex));
-    let addr_norm = format!("0x{}", hex::encode(address));
+    let mut addrs: Vec<[u8; 20]> = addresses_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_addr20)
+        .collect();
+    assert!(!addrs.is_empty(), "--address needs at least one 0x address");
+    addrs.sort();
+    let before = addrs.len();
+    addrs.dedup();
+    assert_eq!(before, addrs.len(), "duplicate address in --address");
+    let addr_hexes: Vec<String> = addrs.iter().map(|a| format!("0x{}", hex::encode(a))).collect();
     println!(
-        "prepare: agent {}, chain {}({chain_id}), threshold {} (native), wallet {addr_norm}, blocks {:?}",
-        ch.agent_id, spec.name, threshold as f64 / 1e18, ch.blocks
+        "prepare: agent {}, chain {}({chain_id}), threshold {} (native), {} wallet(s) {}, blocks {:?}",
+        ch.agent_id, spec.name, threshold as f64 / 1e18, addrs.len(), addr_hexes.join(","), ch.blocks
     );
 
     let mut blocks_json = Vec::with_capacity(ch.blocks.len());
     let mut block_hashes = Vec::with_capacity(ch.blocks.len());
     for &blk in ch.blocks.iter() {
         let block_hex = format!("0x{blk:x}");
-        let inputs = fetch_block(&block_hex, &addr_norm, &header_url, &proof_url);
-        ensure_can_prove(inputs.balance, threshold, false);
+        let inputs = fetch_block(&block_hex, &addrs, &header_url, &proof_url);
+        ensure_can_prove(inputs.total_balance(), threshold, false, addrs.len());
         let bh = keccak256(&inputs.header_rlp);
         let bh_hex = format!("0x{}", hex::encode(bh));
-        println!("  block #{blk}: balance ok, block_hash {bh_hex}");
+        println!("  block #{blk}: combined balance ok, block_hash {bh_hex}");
         block_hashes.push(Value::String(bh_hex.clone()));
+        let wallets_json: Vec<Value> = inputs.wallets.iter().map(|w| serde_json::json!({
+            "address": format!("0x{}", hex::encode(w.address)),
+            "nonce": w.nonce,
+            "balance": format!("0x{:x}", w.balance),
+            "storage_hash": format!("0x{}", hex::encode(w.storage_hash)),
+            "code_hash": format!("0x{}", hex::encode(w.code_hash)),
+            "account_proof": w.account_proof.iter()
+                .map(|n| Value::String(format!("0x{}", hex::encode(n)))).collect::<Vec<_>>(),
+        })).collect();
         blocks_json.push(serde_json::json!({
             "block_number": blk,
             "block_hash": bh_hex,
             "header_rlp": format!("0x{}", hex::encode(&inputs.header_rlp)),
-            "account_proof": inputs.account_proof.iter()
-                .map(|n| Value::String(format!("0x{}", hex::encode(n)))).collect::<Vec<_>>(),
-            "nonce": inputs.nonce,
-            "balance": format!("0x{:x}", inputs.balance),
-            "storage_hash": format!("0x{}", hex::encode(inputs.storage_hash)),
-            "code_hash": format!("0x{}", hex::encode(inputs.code_hash)),
+            "wallets": wallets_json,
         }));
     }
     let challenge_prehash = keccak256(&ch.canonical_bytes().expect("canonical bytes"));
-    // The wallet also signs a per-agent identity message; its signature derives the private
+    // The owner also signs a per-agent identity message; its signature derives the private
     // secret whose keccak256 is the (set-once) on-chain commitment. Text message (personal_sign),
     // not a raw 32-byte blob, so the wallet shows the human what they're binding.
     let token_id = resolve_token_id(&ch.agent_id);
@@ -659,11 +774,12 @@ async fn run_prepare(ch: Challenge, address_hex: &str, out: &str) {
     let prepared = serde_json::json!({
         "version": "por-prepare-v1",
         "challenge": serde_json::to_value(&ch).unwrap(),
-        "address": addr_norm,
+        "address": addr_hexes[0], // back-compat: the first (single-wallet) reserves wallet
+        "addresses": addr_hexes,  // all reserves wallets, ascending (the block_sigs order)
         "debug": false,
         "agent_token_id": token_id,
         "to_sign": {
-            "scheme": "EIP-191 personal_sign: each block_hash + challenge_prehash as raw 32 bytes; identity_message as text",
+            "scheme": "EIP-191 personal_sign. Each wallet in `addresses` signs EVERY block_hash (raw 32 bytes); block_sigs[i] is one signature per wallet in `addresses` order (a bare string is accepted for a single wallet). The owner signs challenge_prehash (raw 32 bytes); identity_message is signed as text.",
             "block_hashes": block_hashes,
             "challenge_prehash": format!("0x{}", hex::encode(challenge_prehash)),
             "identity_message": identity_message,
@@ -672,13 +788,23 @@ async fn run_prepare(ch: Challenge, address_hex: &str, out: &str) {
     });
     File::create(out).unwrap()
         .write_all(serde_json::to_string_pretty(&prepared).unwrap().as_bytes()).unwrap();
-    println!("wrote {out}: {} block hash(es) + the challenge prehash + the identity message to sign", ch.blocks.len());
+    println!("wrote {out}: {} block(s) x {} wallet(s) + the challenge prehash + the identity message to sign", ch.blocks.len(), addrs.len());
 }
 
-// PHASE 2: take the wallet's signatures (sigs.json = {block_sigs:[...], owner_sig}), verify
-// each block signature recovers to the wallet address exactly as the guest will (fail fast,
-// before the slow prove), then attest + prove each block and assemble response.json. The
-// wallet's v (27/28) is normalized to the {0,1} recid the guest/verifier expect.
+// Parse the signatures for one block: `block_sigs[i]` is either a bare hex string (single
+// wallet) or an array of hex strings (one per wallet, in `addresses` order).
+fn block_sig_list(v: &Value, i: usize) -> Vec<String> {
+    match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().map(|x| x.as_str().expect("block sig must be hex").to_string()).collect(),
+        _ => panic!("block_sigs[{i}] must be a hex string or an array of hex strings"),
+    }
+}
+
+// PHASE 2: take the wallet signatures (sigs.json = {block_sigs:[...], owner_sig}), verify each
+// signature recovers to its wallet address exactly as the guest will (fail fast, before the slow
+// prove), then attest + prove each block and assemble response.json. The wallet's v (27/28) is
+// normalized to the {0,1} recid the guest/verifier expect.
 async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: u32) {
     let pv: Value = serde_json::from_str(&std::fs::read_to_string(prepared_path).expect("read prepared"))
         .expect("parse prepared json");
@@ -695,8 +821,6 @@ async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: 
     let blocks = pv["blocks"].as_array().expect("blocks array in prepared");
     let block_sigs = sv["block_sigs"].as_array().expect("block_sigs array in sigs");
     assert_eq!(block_sigs.len(), blocks.len(), "block_sigs ({}) != blocks ({})", block_sigs.len(), blocks.len());
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&hexb(pv["address"].as_str().expect("address in prepared")));
 
     // Per-agent marketplace binding: token id from the challenge agent_id, secret derived from
     // the wallet's identity signature (or POR_AGENT_SECRET override). The key never touches us.
@@ -706,35 +830,42 @@ async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: 
     let t_all = Instant::now();
     let mut bundles = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
-        let inputs = BlockInputs {
-            header_rlp: hexb(b["header_rlp"].as_str().unwrap()),
-            account_proof: b["account_proof"].as_array().unwrap().iter()
-                .map(|n| hexb(n.as_str().unwrap())).collect(),
-            address,
-            nonce: b["nonce"].as_u64().unwrap(),
-            balance: hu128(b["balance"].as_str().unwrap()),
-            storage_hash: h32(b["storage_hash"].as_str().unwrap()),
-            code_hash: h32(b["code_hash"].as_str().unwrap()),
-        };
-        let sig = norm_sig(block_sigs[i].as_str().expect("block sig hex"));
+        let header_rlp = hexb(b["header_rlp"].as_str().unwrap());
+        let wallets: Vec<WalletWitness> = b["wallets"].as_array().expect("wallets array in prepared block")
+            .iter().map(|w| WalletWitness {
+                address: parse_addr20(w["address"].as_str().unwrap()),
+                nonce: w["nonce"].as_u64().unwrap(),
+                balance: hu128(w["balance"].as_str().unwrap()),
+                storage_hash: h32(w["storage_hash"].as_str().unwrap()),
+                code_hash: h32(w["code_hash"].as_str().unwrap()),
+                account_proof: w["account_proof"].as_array().unwrap().iter()
+                    .map(|n| hexb(n.as_str().unwrap())).collect(),
+            }).collect();
+        let inputs = BlockInputs { header_rlp, wallets };
 
-        // Preflight: the wallet's ownership signature must recover to the wallet address,
-        // exactly as the guest checks it -- catch a wrong/bad signature before burning minutes
-        // on a proof the guest would reject.
+        // One ownership sig per wallet (accepts a bare string for a single wallet), normalized.
+        let raw = block_sig_list(&block_sigs[i], i);
+        assert_eq!(raw.len(), inputs.wallets.len(), "block {i}: {} signature(s) != {} wallet(s)", raw.len(), inputs.wallets.len());
+        let sigs: Vec<Vec<u8>> = raw.iter().map(|s| norm_sig(s)).collect();
+
+        // Preflight: each wallet's ownership signature must recover to that wallet's address,
+        // exactly as the guest checks it -- catch a wrong/bad signature before burning minutes.
         let block_hash = keccak256(&inputs.header_rlp);
         let mut m = Vec::with_capacity(28 + 32);
         m.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
         m.extend_from_slice(block_hash.as_slice());
         let prehash = keccak256(&m);
-        let rec = verify::recover_address_from_prehash(&prehash.0, &sig)
-            .unwrap_or_else(|e| panic!("block {i} signature invalid: {e}"));
-        assert_eq!(rec, address, "block {i} signature recovers 0x{} != wallet 0x{}",
-            hex::encode(rec), hex::encode(address));
+        for (w, sig) in inputs.wallets.iter().zip(&sigs) {
+            let rec = verify::recover_address_from_prehash(&prehash.0, sig)
+                .unwrap_or_else(|e| panic!("block {i} wallet 0x{} signature invalid: {e}", hex::encode(w.address)));
+            assert_eq!(rec, w.address, "block {i} signature recovers 0x{} != wallet 0x{}",
+                hex::encode(rec), hex::encode(w.address));
+        }
 
         let block_hex = format!("0x{:x}", b["block_number"].as_u64().unwrap());
-        println!("[block {}/{}] {block_hex}: signature ok, attesting + proving ...", i + 1, blocks.len());
+        println!("[block {}/{}] {block_hex}: {} signature(s) ok, attesting + proving ...", i + 1, blocks.len(), sigs.len());
         let presentation = maybe_attest(&block_hex, spec.rpc_host).await;
-        let bundle = prove_block(&inputs, &sig, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
+        let bundle = prove_block(&inputs, &sigs, threshold, chain_id, debug, &challenge_nonce, &agent_id, token_id, &agent_secret, seg_po2, presentation);
         bundles.push(bundle);
     }
 

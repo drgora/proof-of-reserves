@@ -1,7 +1,14 @@
-// Full proof-of-reserves guest: verify an Ethereum account-state Merkle-Patricia
-// proof against a block header, hide balance + address, prove balance >= threshold,
-// and (unless debug) prove ownership of the address. Journal commits ONLY
-// {block_hash, threshold, chain_id, debug, challenge_nonce, agent_id, block_number}.
+// Full proof-of-reserves guest: verify N Ethereum account-state Merkle-Patricia proofs
+// against a single block header, hide every balance + address, prove that the COMBINED
+// balance across the wallets >= threshold, and (unless debug) prove ownership of each
+// address. Journal commits ONLY {block_hash, threshold, chain_id, debug, challenge_nonce,
+// agent_id, block_number} -- identical whether one wallet or many, so the number of wallets,
+// the individual balances, and the addresses all stay private.
+//
+// Multi-wallet: all wallets are read at the SAME block (one header, one state_root), so a
+// single receipt attests the aggregate reserves at that block. Wallets MUST be supplied
+// distinct and strictly ascending by address; the guest enforces this so the same wallet
+// cannot be listed twice to double-count its balance into the sum.
 //
 // Precompiles: k256 (secp256k1 ecrecover) accelerated via the risc0 fork; keccak
 // accelerated via the risc0 tiny-keccak fork (alloy's backend), so the MPT/header
@@ -45,16 +52,35 @@ fn extract_header_fields(header_rlp: &[u8]) -> HeaderFields {
     HeaderFields { state_root, number }
 }
 
+// Private per-wallet witness: one account's state + its ownership signature. All wallets in
+// a proof share the block header (hence the state_root and block_hash), so the header is read
+// once, outside this struct.
+struct Wallet {
+    address: [u8; 20],
+    nonce: u64,
+    balance: u128,
+    storage_hash: [u8; 32],
+    code_hash: [u8; 32],
+    account_proof: Vec<Vec<u8>>,
+    sig: Vec<u8>, // empty when debug
+}
+
 fn main() {
     // ---- PRIVATE inputs ----
     let header_rlp: Vec<u8> = env::read();
-    let account_proof: Vec<Vec<u8>> = env::read();
-    let address: [u8; 20] = env::read();
-    let nonce: u64 = env::read();
-    let balance: u128 = env::read();
-    let storage_hash: [u8; 32] = env::read();
-    let code_hash: [u8; 32] = env::read();
-    let sig: Vec<u8> = env::read(); // empty when debug
+    // Number of wallets whose balances are summed into the reserves. >= 1.
+    let n_wallets: u32 = env::read();
+    let mut wallets = Vec::with_capacity(n_wallets as usize);
+    for _ in 0..n_wallets {
+        let address: [u8; 20] = env::read();
+        let nonce: u64 = env::read();
+        let balance: u128 = env::read();
+        let storage_hash: [u8; 32] = env::read();
+        let code_hash: [u8; 32] = env::read();
+        let account_proof: Vec<Vec<u8>> = env::read();
+        let sig: Vec<u8> = env::read(); // empty when debug
+        wallets.push(Wallet { address, nonce, balance, storage_hash, code_hash, account_proof, sig });
+    }
     // ---- PUBLIC inputs (committed) ----
     let threshold: u128 = env::read();
     let chain_id: u32 = env::read();
@@ -69,42 +95,65 @@ fn main() {
     let agent_token_id: u64 = env::read(); // PUBLIC: ERC-721 token id from IdentityRegistry
     let agent_secret: [u8; 32] = env::read(); // PRIVATE: never committed raw
 
+    assert!(n_wallets >= 1, "no wallets");
+
     // Header hash + fields (state_root, block number) from the attested RLP.
     let block_hash = keccak256(&header_rlp);
     let fields = extract_header_fields(&header_rlp);
     let state_root = fields.state_root;
 
-    // (1) Account MPT proof: reconstruct the trie account from the private fields and
-    // verify it is the value at keccak(address) under state_root. A wrong balance
-    // reconstructs a different account RLP and fails, binding `balance` to chain state.
-    let account = TrieAccount {
-        nonce,
-        balance: U256::from(balance),
-        storage_root: B256::from(storage_hash),
-        code_hash: B256::from(code_hash),
-    };
-    let account_rlp = alloy_rlp::encode(&account);
-    let key = Nibbles::unpack(keccak256(address));
-    let proof: Vec<Bytes> = account_proof.into_iter().map(Bytes::from).collect();
-    verify_proof(state_root, key, Some(account_rlp), &proof).expect("account MPT proof invalid");
-
-    // (2) Ownership of the (private) address, unless debug.
-    if !debug {
+    // EIP-191 personal_sign prehash of block_hash -- the message every wallet's owner signs
+    // (same for all wallets; computed once). Skipped in debug (no ownership check).
+    let msg_hash = if debug {
+        None
+    } else {
         let mut msg = Vec::with_capacity(60);
         msg.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
         msg.extend_from_slice(block_hash.as_slice());
-        let msg_hash = keccak256(&msg);
-        let signature = Signature::from_slice(&sig[..64]).expect("bad signature");
-        let recid = RecoveryId::from_byte(sig[64]).expect("bad recid");
-        let vk = VerifyingKey::recover_from_prehash(msg_hash.as_slice(), &signature, recid)
-            .expect("recover failed");
-        let enc = vk.to_encoded_point(false);
-        let signer = keccak256(&enc.as_bytes()[1..65]);
-        assert_eq!(signer[12..32], address, "signer address != proven address");
+        Some(keccak256(&msg))
+    };
+
+    // Sum every wallet's balance in U256 (can't overflow a realistic total supply) and require
+    // the COMBINED reserves to meet the threshold. Each wallet must (1) verify against the one
+    // state_root, (2) be owned (unless debug), and (3) be distinct + ascending by address so a
+    // wallet can't be double-counted.
+    let mut total = U256::ZERO;
+    let mut prev = [0u8; 20];
+    for (i, w) in wallets.iter().enumerate() {
+        // (0) Canonical ordering => distinct addresses (blocks listing the same wallet twice).
+        assert!(i == 0 || w.address > prev, "wallets must be distinct and ascending by address");
+        prev = w.address;
+
+        // (1) Account MPT proof: reconstruct the trie account from the private fields and
+        // verify it is the value at keccak(address) under state_root. A wrong balance
+        // reconstructs a different account RLP and fails, binding `balance` to chain state.
+        let account = TrieAccount {
+            nonce: w.nonce,
+            balance: U256::from(w.balance),
+            storage_root: B256::from(w.storage_hash),
+            code_hash: B256::from(w.code_hash),
+        };
+        let account_rlp = alloy_rlp::encode(&account);
+        let key = Nibbles::unpack(keccak256(w.address));
+        let proof: Vec<Bytes> = w.account_proof.iter().cloned().map(Bytes::from).collect();
+        verify_proof(state_root, key, Some(account_rlp), &proof).expect("account MPT proof invalid");
+
+        // (2) Ownership of the (private) address, unless debug.
+        if let Some(msg_hash) = &msg_hash {
+            let signature = Signature::from_slice(&w.sig[..64]).expect("bad signature");
+            let recid = RecoveryId::from_byte(w.sig[64]).expect("bad recid");
+            let vk = VerifyingKey::recover_from_prehash(msg_hash.as_slice(), &signature, recid)
+                .expect("recover failed");
+            let enc = vk.to_encoded_point(false);
+            let signer = keccak256(&enc.as_bytes()[1..65]);
+            assert_eq!(signer[12..32], w.address, "signer address != proven address");
+        }
+
+        total += U256::from(w.balance);
     }
 
-    // (3) Threshold predicate (balance stays private).
-    assert!(balance >= threshold, "balance below threshold");
+    // (3) Threshold predicate on the aggregate (individual balances stay private).
+    assert!(total >= U256::from(threshold), "combined balance below threshold");
 
     // (4) Commit only public values: {block_hash, threshold, chain_id, debug,
     // challenge_nonce, agent_id, block_number}. balance + address stay private.

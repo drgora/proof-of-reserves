@@ -1,9 +1,9 @@
 # Proof-of-Reserves — external agent guide
 
-Prove your agent controls a wallet **and** that it holds **at least `T`** of a
-chain's native coin — **without revealing the balance or the address**. The chain is
-public; the proof is a RISC Zero zkVM receipt bound to a real block header attested by
-TLSNotary. This guide is everything an external agent (or the agent's operator) needs to
+Prove your agent controls **one or more wallets** **and** that their **combined** balance is
+**at least `T`** of a chain's native coin — **without revealing the balances, the addresses,
+or how many wallets**. The chain is public; the proof is a RISC Zero zkVM receipt bound to a
+real block header attested by TLSNotary. This guide is everything an external agent (or the agent's operator) needs to
 generate a proof and submit it to the live verifier.
 
 ## Live service
@@ -119,14 +119,22 @@ Or with a source build, the same args after `por-risc0/target/release/prover` (a
 `NOTARY_ADDR`/`POR_PRIVATE_KEY` as normal env vars).
 
 - `--threshold` is in **wei** of the native coin. `50000000000000000` = 0.05 ETH.
-  Set it to any value **≤ your wallet balance** across the window.
+  Set it to any value **≤ your (combined) wallet balance** across the window.
 - `NOTARY_ADDR` is **required** — this deployment demands a TLSNotary attestation.
 - The command exits `0` on `verified`, non-zero otherwise, and prints the reason.
 
-**Separate reserve wallet from owner?** If the wallet you're proving is *not* the agent's
-registered owner, set both keys: `POR_PRIVATE_KEY=<reserve wallet>` (its balance is
-proven) and `POR_OWNER_KEY=<registered owner EOA>` (signs the challenge). If they're the
-same key, `POR_PRIVATE_KEY` alone is enough — the owner signature falls back to it.
+**Multiple reserve wallets?** Set `POR_PRIVATE_KEY` to a **comma-separated list** of keys —
+`POR_PRIVATE_KEY=<key1>,<key2>,<key3>`. The prover proves that the wallets' **combined**
+native balance is ≥ `--threshold`, in one proof; the individual balances, the addresses, and
+the number of wallets all stay private. (The wallets must be distinct.) This is the usual
+proof-of-reserves shape: reserves split across cold + hot wallets aggregate into a single
+proof.
+
+**Separate reserve wallet(s) from owner?** If the wallet(s) you're proving are *not* the
+agent's registered owner, set both: `POR_PRIVATE_KEY=<reserve key(s)>` (their combined balance
+is proven) and `POR_OWNER_KEY=<registered owner EOA>` (signs the challenge). If the (single)
+reserve wallet *is* the owner, `POR_PRIVATE_KEY` alone is enough — the owner signature falls
+back to its first key.
 
 ---
 
@@ -169,7 +177,7 @@ The challenge **expires in 1 hour** (`expires_at`). Error responses:
 ### 2. Prove the challenge
 
 ```bash
-POR_PRIVATE_KEY=<32-byte hex> \
+POR_PRIVATE_KEY=<32-byte hex>[,<32-byte hex>…] \
 NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286 \
   por-risc0/target/release/prover \
     --challenge challenge.json \
@@ -324,6 +332,6 @@ Verifier   POST https://verifier-production-d672.up.railway.app/v1/challenges
 Notary     NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286
 Chains     --chain-id 1 (Sepolia) · 10 (OP Sepolia) · 8453 (Base Sepolia)
 Threshold  wei of native coin, e.g. 0.05 ETH = 50000000000000000
-Keys       POR_PRIVATE_KEY = reserve wallet (proven);  POR_OWNER_KEY = registered owner (falls back to POR_PRIVATE_KEY)
+Keys       POR_PRIVATE_KEY = reserve wallet key, or a comma-separated list (combined balance proven);  POR_OWNER_KEY = registered owner (falls back to POR_PRIVATE_KEY's first key)
 Build      cd por-risc0 && RISC0_USE_DOCKER=1 cargo build --release --bin prover
 ```
