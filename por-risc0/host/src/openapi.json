@@ -326,9 +326,21 @@
           "image_id": { "type": "string", "description": "The RISC Zero guest image_id the verifier accepts (0x-hex, LE words). Your prover must produce receipts under exactly this id." },
           "block_count": { "type": "integer", "description": "Blocks challenged per session (3)." },
           "window_days": { "type": "integer" },
-          "notary_hint": { "type": "string", "description": "Whether a TLSNotary presentation is required, and the suggested NOTARY_ADDR." },
+          "notary_hint": { "type": "string", "description": "Whether a TLSNotary presentation is required, and where to find the NOTARY_ADDR to use." },
+          "notary_addr": { "type": ["string", "null"], "description": "The live TLSNotary host:port to set as NOTARY_ADDR (the operator's public notary endpoint), or null if none is published. Read this dynamically — the value can move between notary redeploys." },
           "endpoints": { "type": "object", "additionalProperties": { "type": "string" } },
           "chains": { "$ref": "#/components/schemas/ChainList" },
+          "tooling": {
+            "type": "object",
+            "description": "Where to obtain and run the prover / MCP tooling. Docker images are self-contained (no source checkout); the MCP server lives in the repo.",
+            "properties": {
+              "repo": { "type": "string", "description": "Source repository." },
+              "recommended": { "type": "string" },
+              "prover_cli": { "type": "object", "description": "Headless Docker prover for AI agents (image, pull, run).", "additionalProperties": { "type": "string" } },
+              "prover_web": { "type": "object", "description": "Browser-wallet Docker app for humans (image, run).", "additionalProperties": { "type": "string" } },
+              "mcp_server": { "type": "object", "description": "MCP server for AI agents (repo path, install, transport, prerequisites).", "additionalProperties": { "type": "string" } }
+            }
+          },
           "links": {
             "type": "object",
             "properties": {

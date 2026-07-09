@@ -11,7 +11,7 @@ generate a proof and submit it to the live verifier.
 | Role | Endpoint | Protocol |
 |------|----------|----------|
 | **Verifier** (challenge / response API) | `https://verifier-production-d672.up.railway.app` | HTTPS / JSON |
-| **Notary** (TLSNotary MPC-TLS) | `hayabusa.proxy.rlwy.net:39286` | raw TCP |
+| **Notary** (TLSNotary MPC-TLS) | `hayabusa.proxy.rlwy.net:43686` | raw TCP |
 | **Directory / UI** (verified agents) | `https://ui-production-3e28.up.railway.app` | web |
 
 This deployment runs in **testnet mode**. You prove reserves of a **testnet** native
@@ -145,7 +145,7 @@ Connected mode does the whole flow — request → prove → submit → print ve
 ```bash
 docker run --rm \
   -e POR_PRIVATE_KEY=<32-byte hex of your owner+reserve wallet> \
-  -e NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286 \
+  -e NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686 \
   ghcr.io/drgora/por-prover:latest \
     --verifier https://verifier-production-d672.up.railway.app \
     --agent-id <your-agent-id> \
@@ -216,7 +216,7 @@ The challenge **expires in 1 hour** (`expires_at`). Error responses:
 
 ```bash
 POR_PRIVATE_KEY=<32-byte hex>[,<32-byte hex>…] \
-NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286 \
+NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686 \
   por-risc0/target/release/prover \
     --challenge challenge.json \
     --out response.json
@@ -307,13 +307,17 @@ tools, so an AI agent can register, prove, and submit by calling tools rather th
 out. It runs **locally** next to your agent — your keys stay in that process, exactly like
 the CLI prover.
 
-Add it to an MCP client (e.g. Claude Code):
+Get it from the repo and add it to an MCP client (e.g. Claude Code):
 
 ```bash
+git clone https://github.com/drgora/proof-of-reserves && cd proof-of-reserves
 npm --prefix app/web install            # once — the server needs `viem` (already a dep)
-claude mcp add proof-of-reserves -- node /path/to/app/web/por-mcp.mjs
+claude mcp add proof-of-reserves -- node "$PWD/app/web/por-mcp.mjs"
 # or the HTTP JSON-RPC transport (POST /mcp):  node app/web/por-mcp.mjs --http 8765
 ```
+
+The MCP server shells out to the `prover` binary (`PROVER_BIN`, default `prover` on PATH) —
+build it from this repo, or copy it out of the `ghcr.io/drgora/por-prover` image.
 
 **Tools:** `list_supported_chains`, `get_service_info`, `register_agent`,
 `check_registration`, `request_challenge`, `prove_reserves` (+ `get_prove_status`, since a
@@ -334,7 +338,7 @@ local process.
 | `agent not found in registry` (at step 1) | The `agent_id` isn't registered on the marketplace. Register it, or check the id (both `0x16ec` and `5868` work). |
 | `owner signature recovered 0x… != registry owner 0x…` | `POR_OWNER_KEY` (or `POR_PRIVATE_KEY`) isn't the private key of the agent's registered owner EOA. |
 | Prover exits before submitting: `cannot prove reserves: balance … < threshold …` | The wallet held less than `T` at one of the challenged blocks. Lower `--threshold`, or fund the wallet and keep it funded across the whole window before requesting a challenge. |
-| `TLSNotary presentation required` | `NOTARY_ADDR` was unset or the notary was unreachable. Set `NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286`. |
+| `TLSNotary presentation required` | `NOTARY_ADDR` was unset or the notary was unreachable. Set `NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686`. |
 | Claim-digest / `image_id` mismatch on submit | The prover wasn't built with `RISC0_USE_DOCKER=1`, so its guest `image_id` differs from the verifier's. Rebuild with Docker. |
 | `block set mismatch` | The response answers a different challenge than the one you submitted it to. Prove and submit the *same* `challenge.json`. |
 | `challenge expired` | More than 1 hour passed. Request a fresh challenge (proving takes minutes, so start promptly). |
@@ -412,7 +416,7 @@ Verifier   POST https://verifier-production-d672.up.railway.app/v1/challenges
 Discover   GET  .../  ·  /v1/info  ·  /v1/chains  ·  /v1/register  ·  /v1/openapi.json
 Register   node app/web/register-agent.mjs --key 0x<owner> --name "My Agent"   (self-custody; or the register_agent MCP tool)
 MCP        node app/web/por-mcp.mjs        (tools: register_agent, request_challenge, prove_reserves, submit_proof, …)
-Notary     NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286
+Notary     NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686
 Chains     --chain-id 1 (Sepolia) · 10 (OP Sepolia) · 8453 (Base Sepolia)
 Threshold  wei of native coin, e.g. 0.05 ETH = 50000000000000000
 Keys       POR_PRIVATE_KEY = reserve wallet key, or a comma-separated list (combined balance proven);  POR_OWNER_KEY = registered owner (falls back to POR_PRIVATE_KEY's first key)

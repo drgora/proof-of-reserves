@@ -31,7 +31,7 @@ COPY prover-web.mjs ./
 ENV PUBLIC_DIR=/app/dist \
     PORT=8080 \
     VERIFIER_URL=https://verifier-production-d672.up.railway.app \
-    NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286 \
+    NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686 \
     REGISTRY_URL=https://ui-production-3e28.up.railway.app
 EXPOSE 8080
 CMD ["node", "prover-web.mjs"]

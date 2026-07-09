@@ -10,7 +10,7 @@
 //
 // Config (env):
 //   VERIFIER_URL          default https://verifier-production-d672.up.railway.app
-//   NOTARY_ADDR           default hayabusa.proxy.rlwy.net:39286 (passed to the prover)
+//   NOTARY_ADDR           default hayabusa.proxy.rlwy.net:43686 (passed to the prover)
 //   BASE_SEPOLIA_RPC_URL  default https://sepolia.base.org (registration + ownerOf reads)
 //   IDENTITY_REGISTRY     default 0x8004A818BFB912233c491871b3d84c89A494BD9e
 //   PROVER_BIN            default "prover" (the prover binary/Docker entrypoint on PATH)
@@ -34,7 +34,7 @@ import { registerAgent } from './register-agent.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const VERIFIER_URL = (process.env.VERIFIER_URL || 'https://verifier-production-d672.up.railway.app').replace(/\/$/, '')
-const NOTARY_ADDR = process.env.NOTARY_ADDR || 'hayabusa.proxy.rlwy.net:39286'
+const NOTARY_ADDR = process.env.NOTARY_ADDR || 'hayabusa.proxy.rlwy.net:43686'
 const BASE_RPC = process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org'
 const IDENTITY_REGISTRY = process.env.IDENTITY_REGISTRY || '0x8004A818BFB912233c491871b3d84c89A494BD9e'
 const PROVER_BIN = process.env.PROVER_BIN || 'prover'

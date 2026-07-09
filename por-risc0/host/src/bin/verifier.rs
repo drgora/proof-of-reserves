@@ -401,6 +401,10 @@ fn chains_value(state: &AppState) -> Value {
 fn service_info_value(state: &AppState) -> Value {
     let ui = std::env::var("POR_UI_URL").unwrap_or_else(|_| DEFAULT_UI_URL.into());
     let ui = ui.trim_end_matches('/');
+    // The live TLSNotary endpoint agents should pass as NOTARY_ADDR. Read from env so it is
+    // reported dynamically — Railway's public proxy port moves on every notary redeploy, so
+    // agents read it here rather than hardcoding a value that goes stale.
+    let notary_addr = std::env::var("POR_NOTARY_ADDR").ok();
     json!({
         "service": "proof-of-reserves-verifier",
         "version": SERVICE_VERSION,
@@ -411,8 +415,11 @@ fn service_info_value(state: &AppState) -> Value {
         "notary_hint": if state.allow_no_presentation {
             "TLSNotary presentation optional on this instance (dev mode)"
         } else {
-            "TLSNotary presentation REQUIRED — set NOTARY_ADDR on your prover"
+            "TLSNotary presentation REQUIRED — set NOTARY_ADDR on your prover (see tooling.notary_addr)"
         },
+        // The live TLSNotary host:port to set as NOTARY_ADDR, or null if the operator hasn't
+        // published one (then see the guide / ask the operator).
+        "notary_addr": notary_addr,
         "endpoints": {
             "request_challenge": "POST /v1/challenges",
             "submit_response": "POST /v1/challenges/{id}/response",
@@ -422,6 +429,31 @@ fn service_info_value(state: &AppState) -> Value {
             "openapi": "GET /v1/openapi.json"
         },
         "chains": chains_value(state),
+        // Where to GET the prover / MCP tooling. Agents that query this descriptor to "find the
+        // prover" land here: the Docker images are self-contained (no checkout), the MCP server
+        // lives in the repo.
+        "tooling": {
+            "repo": "https://github.com/drgora/proof-of-reserves",
+            "recommended": "prover_cli (Docker) for AI agents; prover_web (Docker) for humans",
+            "prover_cli": {
+                "for": "AI agents — headless, self-contained (r0vm baked in, no source checkout needed)",
+                "image": "ghcr.io/drgora/por-prover:latest",
+                "pull": "docker pull ghcr.io/drgora/por-prover:latest",
+                "run": "docker run --rm -e POR_PRIVATE_KEY=<32B hex> -e POR_OWNER_KEY=<32B hex> -e NOTARY_ADDR=<tooling.notary_addr> ghcr.io/drgora/por-prover:latest --verifier <this verifier base URL> --agent-id <id> --threshold <wei> --chain-id 1"
+            },
+            "prover_web": {
+                "for": "humans — browser wallet, private key never leaves the browser",
+                "image": "ghcr.io/drgora/por-prove-web:latest",
+                "run": "docker run --rm -p 8080:8080 ghcr.io/drgora/por-prove-web:latest"
+            },
+            "mcp_server": {
+                "for": "AI agents via Model Context Protocol (keys stay in-process)",
+                "path": "app/web/por-mcp.mjs (in tooling.repo)",
+                "install": "git clone https://github.com/drgora/proof-of-reserves && npm --prefix proof-of-reserves/app/web install && claude mcp add proof-of-reserves -- node \"$PWD/proof-of-reserves/app/web/por-mcp.mjs\"",
+                "http_transport": "node app/web/por-mcp.mjs --http 8765",
+                "requires": "the `prover` binary on PATH (set PROVER_BIN) — build from the repo or copy it out of the por-prover image"
+            }
+        },
         "links": {
             "guide": format!("{ui}/docs"),
             "openapi": "/v1/openapi.json",

@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os'
 const PORT = Number(process.env.PORT || 8080)
 const VERIFIER_URL = (process.env.VERIFIER_URL || 'https://verifier-production-d672.up.railway.app').replace(/\/$/, '')
 const REGISTRY_URL = (process.env.REGISTRY_URL || 'https://ui-production-3e28.up.railway.app').replace(/\/$/, '')
-const NOTARY_ADDR = process.env.NOTARY_ADDR || 'hayabusa.proxy.rlwy.net:39286'
+const NOTARY_ADDR = process.env.NOTARY_ADDR || 'hayabusa.proxy.rlwy.net:43686'
 const PROVER_BIN = process.env.PROVER_BIN || 'prover'
 const PUBLIC_DIR = process.env.PUBLIC_DIR || join(process.cwd(), 'dist')
 const WORK_DIR = process.env.WORK_DIR || join(tmpdir(), 'por-jobs')

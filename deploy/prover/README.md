@@ -16,7 +16,7 @@ cd ../../por-risc0 && RISC0_USE_DOCKER=1 cargo build --release --bin prover
 deploy/prover/build.sh                 # build   (PUSH=1 to also push)
 docker run --rm \
   -e POR_PRIVATE_KEY=<32B hex> \
-  -e NOTARY_ADDR=hayabusa.proxy.rlwy.net:39286 \
+  -e NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686 \
   ghcr.io/drgora/por-prover:latest \
     --verifier https://verifier-production-d672.up.railway.app \
     --agent-id <id> --threshold <wei> --chain-id 1
