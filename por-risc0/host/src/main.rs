@@ -473,6 +473,111 @@ fn resolve_secret_from_sig(custom_secret: Option<&str>, identity_sig: Option<&st
     }
 }
 
+// --- marketplace identity preflight ----------------------------------------
+// The ValidationGateway binds a SET-ONCE commitment per (agentId, proofType). A proof whose
+// committed identity doesn't match a previously-registered commitment makes recordValidation
+// revert "Identity binding mismatch" -- but only AFTER minutes of proving. Check it up front.
+// The prover reads ONE fixed env contract (POR_AGENT_SECRET etc.); it does not guess aliases --
+// mapping arbitrary inputs onto these names is the calling agent's job (see AGENT_GUIDE.md).
+
+/// The set-once commitment this proof will present: `reverse(keccak256(agent_secret))` -- the
+/// gateway's `_extractField(pubs, identityBindingOffset, 32, littleEndian)` cast to bytes32
+/// (see `marketplace_offsets`). An all-zero secret means no binding (demo/legacy).
+fn expected_commitment(agent_secret: &[u8; 32]) -> Option<[u8; 32]> {
+    if agent_secret == &[0u8; 32] {
+        return None;
+    }
+    let mut c: [u8; 32] = keccak256(agent_secret).into();
+    c.reverse(); // LE journal integer -> BE bytes32, matching the gateway cast
+    Some(c)
+}
+
+/// Best-effort read of `agentCommitments(agentId, proofType)` on the marketplace chain (Base
+/// Sepolia). Returns None on ANY RPC/decode error -- the caller treats "unknown" as "don't
+/// block". Gateway/RPC/proofType are overridable but default to the live deployment.
+fn read_agent_commitment(token_id: u64, proof_type: &str) -> Option<[u8; 32]> {
+    let gateway = std::env::var("POR_GATEWAY")
+        .unwrap_or_else(|_| "0xbbdcb0C9C3B9ce60555fdF50cFB99802E7c33920".into());
+    let rpc_url = std::env::var("POR_MARKETPLACE_RPC_URL")
+        .unwrap_or_else(|_| "https://sepolia.base.org".into());
+    // ABI-encode agentCommitments(uint256,string): selector ++ agentId ++ offset(0x40) ++ len ++ str
+    let mut data = Vec::new();
+    data.extend_from_slice(&keccak256(b"agentCommitments(uint256,string)")[..4]);
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&token_id.to_be_bytes());
+    data.extend_from_slice(&w); // agentId
+    let mut off = [0u8; 32];
+    off[31] = 0x40;
+    data.extend_from_slice(&off); // offset to the string arg
+    let pt = proof_type.as_bytes();
+    let mut len = [0u8; 32];
+    len[24..].copy_from_slice(&(pt.len() as u64).to_be_bytes());
+    data.extend_from_slice(&len);
+    let mut padded = pt.to_vec();
+    while padded.len() % 32 != 0 {
+        padded.push(0);
+    }
+    data.extend_from_slice(&padded);
+
+    let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_call",
+        "params":[{"to":gateway,"data":format!("0x{}",hex::encode(&data))},"latest"]})
+    .to_string();
+    let out = Command::new("curl")
+        .args(["-s", "-m", "15", "-X", "POST", "-H", "content-type: application/json",
+               "-H", "accept-encoding: identity", "--data", &body, &rpc_url])
+        .output()
+        .ok()?;
+    let resp: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let hexstr = resp.get("result")?.as_str()?;
+    let bytes = hexb(hexstr);
+    (bytes.len() == 32).then(|| h32(hexstr))
+}
+
+/// Before the (slow) prove, verify this run's identity will satisfy the marketplace's set-once
+/// binding, and abort on a GUARANTEED mismatch (saves minutes of proving a bundle that
+/// recordValidation would reject). Best-effort: no-op for demo/zero-secret, and never blocks on
+/// an unreachable gateway. Bypass entirely with POR_SKIP_IDENTITY_PRECHECK=1.
+fn preflight_identity_binding(token_id: u64, agent_secret: &[u8; 32]) {
+    if std::env::var("POR_SKIP_IDENTITY_PRECHECK").is_ok() {
+        return;
+    }
+    if token_id == 0 {
+        return; // demo / non-marketplace run
+    }
+    let Some(expected) = expected_commitment(agent_secret) else {
+        eprintln!("identity: agent_secret is zero -> no marketplace binding (recordValidation will not \
+                   match a commitment). Set POR_AGENT_SECRET if this agent is registered.");
+        return;
+    };
+    let exp_hex = format!("0x{}", hex::encode(expected));
+    let proof_type = std::env::var("POR_PROOF_TYPE").unwrap_or_else(|_| "proof-of-reserves".into());
+    match read_agent_commitment(token_id, &proof_type) {
+        None => eprintln!("identity preflight: could not read on-chain commitment (continuing) -> \
+                           this proof will present {exp_hex}"),
+        Some(z) if z == [0u8; 32] => println!(
+            "identity preflight: agent {token_id} has no commitment yet -> it will be bound to \
+             {exp_hex} on first recordValidation"
+        ),
+        Some(existing) if existing == expected => {
+            println!("identity preflight OK: agent {token_id} commitment matches on-chain ({exp_hex})")
+        }
+        Some(existing) => {
+            eprintln!();
+            eprintln!("ERROR: marketplace identity binding mismatch -- aborting BEFORE the (slow) prove.");
+            eprintln!("  agent {token_id} is already registered (SET-ONCE) with commitment:");
+            eprintln!("    0x{}", hex::encode(existing));
+            eprintln!("  but this run's agent_secret derives:");
+            eprintln!("    {exp_hex}");
+            eprintln!("  recordValidation would revert \"Identity binding mismatch\".");
+            eprintln!("  Fix: set POR_AGENT_SECRET to the ORIGINAL 32-byte secret this agent was");
+            eprintln!("       registered with (exact name -- the POR_ prefix is required; a bare");
+            eprintln!("       AGENT_SECRET is ignored), or prove under a fresh, unregistered agent id.");
+            eprintln!("  Bypass this check: POR_SKIP_IDENTITY_PRECHECK=1");
+            std::process::exit(1);
+        }
+    }
+}
+
 // Sign the challenge digest with the owner EOA (POR_OWNER_KEY, falling back to the FIRST
 // POR_PRIVATE_KEY entry -- the reserves-wallet key list is comma-separated).
 fn owner_sign(ch: &Challenge) -> Option<String> {
@@ -582,6 +687,7 @@ async fn prove_challenge(
     // a demo run shouldn't bind a real agent's commitment, so token id + secret stay 0.
     let token_id = if debug { 0 } else { resolve_token_id(&ch.agent_id) };
     let agent_secret = if debug { [0u8; 32] } else { resolve_secret_cli(first_key, token_id) };
+    preflight_identity_binding(token_id, &agent_secret);
 
     let mut bundles = Vec::with_capacity(ch.blocks.len());
     let t_all = Instant::now();
@@ -826,6 +932,7 @@ async fn run_finalize(prepared_path: &str, sigs_path: &str, out: &str, seg_po2: 
     // the wallet's identity signature (or POR_AGENT_SECRET override). The key never touches us.
     let token_id = resolve_token_id(&ch.agent_id);
     let agent_secret = resolve_secret_from_sig(sv["agent_secret"].as_str(), sv["identity_sig"].as_str());
+    preflight_identity_binding(token_id, &agent_secret);
 
     let t_all = Instant::now();
     let mut bundles = Vec::with_capacity(blocks.len());

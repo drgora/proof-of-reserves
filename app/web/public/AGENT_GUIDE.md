@@ -405,6 +405,52 @@ gateway once (`registerAgentCommitment`). This is advanced and gateway-specific 
 operator for the identity-binding values. Without it you still get a valid `verified`
 verdict; you just won't be listed.
 
+The commitment is **set-once**: once an agent id has a registered identity commitment, every
+later proof for that agent must present the **same** secret. Before the (slow) prove, the
+prover now runs a **preflight** that reads the on-chain commitment and **aborts immediately**
+if this run's secret can't match it — so a wrong/missing `POR_AGENT_SECRET` fails in seconds,
+not after ~20 minutes at `recordValidation`. (Bypass with `POR_SKIP_IDENTITY_PRECHECK=1`.)
+
+---
+
+## Inputs → environment variables (your responsibility)
+
+The prover reads **one fixed set of environment variables, by exact name**. It does **not**
+guess aliases: a value passed as `AGENT_SECRET`, `secret`, `--secret`, or anything without the
+`POR_` prefix is **silently ignored**, and the prover falls back to a derived value — which is
+exactly how you get a `verified` proof that then fails `recordValidation` with *"Identity
+binding mismatch"*.
+
+**You (the calling agent) are the adapter.** However your inputs arrive — a natural-language
+prompt, a `.env` file, a JSON config, or nothing at all — it is your job to translate them into
+these exact variables before invoking the prover. If a user's prompt says *"the agent secret is
+0xabc…"*, that means you must run the prover with `POR_AGENT_SECRET=0xabc…`. Note `.env` is only
+auto-loaded by `docker compose`; a bare `prover`/`docker run`/MCP invocation inherits nothing
+you didn't explicitly set.
+
+| Input you might be given | Exact variable to set | Notes |
+|--------------------------|-----------------------|-------|
+| reserve wallet key(s)    | `POR_PRIVATE_KEY`     | 0x hex; comma-separated for multiple wallets |
+| agent owner key          | `POR_OWNER_KEY`       | signs the challenge; falls back to the first `POR_PRIVATE_KEY` |
+| marketplace identity secret | `POR_AGENT_SECRET` | **required** if the agent already has a set-once commitment; else derived from the owner key |
+| numeric token id         | `POR_AGENT_TOKEN_ID`  | optional; otherwise parsed from `--agent-id` |
+| notary endpoint          | `NOTARY_ADDR`         | e.g. `hayabusa.proxy.rlwy.net:43686` |
+| archive RPC for a chain  | `POR_RPC_URL_<chainId>` | e.g. `POR_RPC_URL_1` |
+
+How to set them, per launch method:
+
+```bash
+# CLI (same command):
+POR_AGENT_SECRET=0x<secret> POR_OWNER_KEY=0x<owner> prover --verifier <url> --agent-id <id> --threshold <wei>
+
+# Docker (-e per var):
+docker run --rm -e POR_AGENT_SECRET=0x<secret> -e POR_PRIVATE_KEY=0x<key> ghcr.io/drgora/por-prover:latest --verifier <url> --agent-id <id> --threshold <wei>
+```
+
+Via the **MCP** server, pass them as tool arguments to `prove_reserves` (`agentSecret`,
+`tokenId`, `privateKey`, `ownerKey`) — the server maps each onto the matching `POR_*` variable
+for the prover child. That is the same adapter step, done at the tool boundary.
+
 ---
 
 ## Quick reference

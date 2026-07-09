@@ -95,12 +95,16 @@ async function checkRegistration(agentId) {
 const jobs = new Map() // jobId -> { state, verdict, reason, log, exitCode, startedAt }
 const clip = (s, n = 6000) => (s.length > n ? s.slice(-n) : s)
 
-function startProveJob({ agentId, threshold, chainId, privateKey, ownerKey, notaryAddr, verifierUrl }) {
+function startProveJob({ agentId, threshold, chainId, privateKey, ownerKey, notaryAddr, verifierUrl, agentSecret, tokenId }) {
   const jobId = randomBytes(6).toString('hex')
   const args = ['--verifier', verifierUrl || VERIFIER_URL, '--agent-id', String(agentId), '--threshold', String(threshold)]
   if (chainId != null) args.push('--chain-id', String(chainId))
   const env = { ...process.env, POR_PRIVATE_KEY: privateKey }
   if (ownerKey) env.POR_OWNER_KEY = ownerKey
+  // Map the agent-supplied identity inputs onto the prover's exact env contract. The prover
+  // does no alias resolution, so this explicit mapping is the agent's job (done here).
+  if (agentSecret) env.POR_AGENT_SECRET = agentSecret
+  if (tokenId != null) env.POR_AGENT_TOKEN_ID = String(tokenId)
   const na = notaryAddr ?? NOTARY_ADDR
   if (na && na !== 'none') env.NOTARY_ADDR = na
   else delete env.NOTARY_ADDR
@@ -211,19 +215,22 @@ const TOOLS = [
   },
   {
     name: 'prove_reserves',
-    description: 'Run the full flow end-to-end: request a challenge, prove all 3 blocks locally with the `prover` binary, and submit — using connected mode. Returns a jobId immediately (proving takes ~15-30 min); poll get_prove_status. Requires the `prover` binary on PATH (or PROVER_BIN). privateKey is the reserve wallet key (comma-separate for multiple wallets); ownerKey defaults to privateKey. Keys stay in this local process.',
+    description: 'Run the full flow end-to-end: request a challenge, prove all 3 blocks locally with the `prover` binary, and submit — using connected mode. Returns a jobId immediately (proving takes ~15-30 min); poll get_prove_status. Requires the `prover` binary on PATH (or PROVER_BIN). privateKey is the reserve wallet key (comma-separate for multiple wallets); ownerKey defaults to privateKey. IMPORTANT: if this agent was already registered with a specific marketplace identity secret, you MUST pass it as `agentSecret` (it maps to POR_AGENT_SECRET) or the final on-chain recordValidation reverts "Identity binding mismatch"; if omitted, the secret is derived deterministically from ownerKey. Keys stay in this local process.',
     inputSchema: S({
       agentId: str('Registered marketplace agent id.'),
       threshold: num('Minimum combined reserves in wei (decimal string).'),
       privateKey: str('Reserve wallet private key (0x hex); comma-separated list for multiple wallets. Stays local.'),
       chainId: num('Chain selector (default 1).'),
       ownerKey: str('Agent owner key that signs the challenge (defaults to privateKey\'s first key).'),
+      agentSecret: str('The agent\'s 32-byte marketplace identity secret (0x hex) → POR_AGENT_SECRET. Required if this agent already has a registered (set-once) identity commitment; take it from wherever you were given it (prompt, config, .env). Omit only for a brand-new agent, where it is derived from ownerKey.'),
+      tokenId: num('Numeric ERC-721 token id override → POR_AGENT_TOKEN_ID. Omit to parse it from agentId.'),
       notaryAddr: str('Override the TLSNotary notary host:port ("none" to disable — dev only).'),
     }, ['agentId', 'threshold', 'privateKey']),
     handler: async (a) => {
       const jobId = startProveJob({
         agentId: a.agentId, threshold: a.threshold, chainId: a.chainId,
         privateKey: a.privateKey, ownerKey: a.ownerKey, notaryAddr: a.notaryAddr,
+        agentSecret: a.agentSecret, tokenId: a.tokenId,
       })
       return { jobId, state: jobs.get(jobId).state, message: 'Proving started in the background. Poll get_prove_status with this jobId (expect ~15-30 min).' }
     },
