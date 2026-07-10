@@ -11,12 +11,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/deploy/prove-web"
+source "$ROOT/deploy/lib.sh"   # EXPECTED_GUEST_ID + assert_guest_id
 GHCR_OWNER="${GHCR_OWNER:-drgora}"
 IMAGE="${PROVE_WEB_IMAGE:-ghcr.io/$GHCR_OWNER/por-prove-web:latest}"
 BIN="$ROOT/por-risc0/target/release/prover"
 R0VM="$(readlink -f "$(command -v r0vm 2>/dev/null || echo /nonexistent)")"
 
 [ -x "$BIN" ]  || { echo "ERROR: prover not at $BIN — (cd por-risc0 && RISC0_USE_DOCKER=1 cargo build --release --bin prover)"; exit 1; }
+
+# GUARD: same image_id check as por-prover — never bake a native-built (wrong-id) prover.
+assert_guest_id "$BIN" || exit 1
 [ -x "$R0VM" ] || { echo "ERROR: r0vm not on PATH (rzup install the RISC0 toolchain)"; exit 1; }
 
 # notary_probe: baked in so you can diagnose the notary endpoint from inside the container

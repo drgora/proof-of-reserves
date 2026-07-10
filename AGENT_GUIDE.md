@@ -65,7 +65,8 @@ Before you can get a `verified` verdict you need all four:
    `image_id`; a prover with a different id is rejected before proving finishes.)
 4. **A machine with a few CPU cores and time** — proving is CPU-heavy:
    **~15–30 minutes per challenge** (3 blocks; ~6 min/block measured on CPU). ~4 GB free
-   RAM; a ≥16 GB CUDA GPU speeds it up but is optional.
+   RAM. **GPU is optional:** the Docker image auto-uses an NVIDIA GPU (≥16 GB VRAM) when you
+   add `--gpus all`, and otherwise falls back to CPU — see *GPU acceleration* under Path A.
 
 ### Get the prover (Docker — recommended)
 
@@ -173,6 +174,31 @@ agent's registered owner, set both: `POR_PRIVATE_KEY=<reserve key(s)>` (their co
 is proven) and `POR_OWNER_KEY=<registered owner EOA>` (signs the challenge). If the (single)
 reserve wallet *is* the owner, `POR_PRIVATE_KEY` alone is enough — the owner signature falls
 back to its first key.
+
+### GPU acceleration (optional)
+
+The Docker image is **unified CPU/GPU** and chooses the backend at runtime. Add `--gpus all`:
+on a host whose NVIDIA GPU has **≥16 GB free VRAM** it proves on the GPU (several× faster);
+with no `--gpus`, no driver, too little VRAM, or an unsupported GPU it **silently falls back to
+the same CPU path** — so the command is safe to run anywhere.
+
+```bash
+docker run --rm --gpus all \
+  -e POR_PRIVATE_KEY=<hex> -e NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686 \
+  ghcr.io/drgora/por-prover:latest \
+    --verifier https://verifier-production-d672.up.railway.app \
+    --agent-id <id> --threshold <wei> --chain-id 1
+```
+
+- **See which backend a host would pick, without proving:**
+  `docker run --rm --gpus all ghcr.io/drgora/por-prover:latest --print-backend` → prints `gpu` or `cpu`.
+- **Supported GPUs** (native SASS baked in): `sm_80` (A100), `sm_86` (A10/A40/RTX 30xx),
+  `sm_89` (L4/L40/RTX 40xx), `sm_90` (H100). Anything else — Blackwell for now, or <16 GB cards — uses CPU.
+- **Overrides:** `POR_PROVER_BACKEND=auto|cpu|gpu` forces a backend; `POR_MIN_VRAM_GB` (default 16)
+  sets the free-VRAM bar.
+- **Not using Docker** (source build / MCP): the bare `prover` uses CPU. For GPU there, build a
+  CUDA `r0vm` and set `RISC0_PROVER=ipc RISC0_SERVER_PATH=/path/to/cuda-r0vm` (the Docker image
+  does exactly this internally).
 
 ---
 
@@ -317,7 +343,10 @@ claude mcp add proof-of-reserves -- node "$PWD/app/web/por-mcp.mjs"
 ```
 
 The MCP server shells out to the `prover` binary (`PROVER_BIN`, default `prover` on PATH) —
-build it from this repo, or copy it out of the `ghcr.io/drgora/por-prover` image.
+build it from this repo, or copy it out of the `ghcr.io/drgora/por-prover` image. Proving is
+**CPU by default** here (it runs the bare prover, not the Docker entrypoint); for GPU, set
+`RISC0_PROVER=ipc RISC0_SERVER_PATH=/path/to/cuda-r0vm` in the server's environment (it's passed
+through to the prover child), or point `PROVER_BIN` at a `--gpus`-enabled Docker wrapper.
 
 **Tools:** `list_supported_chains`, `get_service_info`, `register_agent`,
 `check_registration`, `request_challenge`, `prove_reserves` (+ `get_prove_status`, since a
@@ -436,6 +465,8 @@ you didn't explicitly set.
 | numeric token id         | `POR_AGENT_TOKEN_ID`  | optional; otherwise parsed from `--agent-id` |
 | notary endpoint          | `NOTARY_ADDR`         | e.g. `hayabusa.proxy.rlwy.net:43686` |
 | archive RPC for a chain  | `POR_RPC_URL_<chainId>` | e.g. `POR_RPC_URL_1` |
+| force GPU/CPU backend    | `POR_PROVER_BACKEND`  | Docker image only; `auto` (default) / `cpu` / `gpu` |
+| min GPU VRAM to use GPU  | `POR_MIN_VRAM_GB`     | Docker image only; default `16` |
 
 How to set them, per launch method:
 

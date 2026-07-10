@@ -18,6 +18,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+source "$ROOT/deploy/lib.sh"   # EXPECTED_GUEST_ID + assert_guest_id
 # Publish under a PERSONAL GHCR namespace: the org (horizenlabs) blocks public
 # packages, and Railway pulls the image anonymously at build time. Personal
 # accounts allow public packages. Override the whole ref with RISC0_RUNTIME_IMAGE,
@@ -40,10 +41,17 @@ mkdir -p "$HERE/bin"
 cp "$ROOT/por-risc0/target/release/notary"   "$HERE/bin/notary"
 cp "$ROOT/por-risc0/target/release/verifier" "$HERE/bin/verifier"
 
+# GUARD: the verifier embeds the guest image_id it will accept; it MUST match the marketplace
+# vkHash or every real proof is rejected. Catch a native (non-Docker) build before it ships.
+assert_guest_id "$HERE/bin/verifier" || exit 1
+
 echo ">> docker build $IMAGE"
 docker build -f "$HERE/Dockerfile.runtime" -t "$IMAGE" "$HERE"
 
-echo ">> docker push $IMAGE"
-docker push "$IMAGE"
-
-echo ">> done. Redeploy the 'notary' and 'verifier' Railway services to pull the new image."
+if [ "${PUSH:-1}" = 1 ]; then
+  echo ">> docker push $IMAGE"
+  docker push "$IMAGE"
+  echo ">> done. Redeploy the 'notary' and 'verifier' Railway services to pull the new image."
+else
+  echo ">> built (PUSH=0, not pushed). Set PUSH=1 to push $IMAGE."
+fi

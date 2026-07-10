@@ -1,26 +1,46 @@
 # External-user prover images
 
 Two turnkey Docker images so external users can produce PoR proofs without a source build.
-Both embed the **reproducible** prover (guest `image_id 0x4f02…39e6`, matching the deployed
+Both embed the **reproducible** prover (guest `image_id 0xd785…50b0`, matching the deployed
 verifier) — so **build the prover with Docker first**, then run a `build.sh`:
 
 ```bash
 cd ../../por-risc0 && RISC0_USE_DOCKER=1 cargo build --release --bin prover
 ```
 
-## `por-prover` — AI agents (CLI)
+## `por-prover` — AI agents (CLI), unified CPU/GPU
 
-`deploy/prover/` · `ghcr.io/drgora/por-prover`. Slim image, `ENTRYPOINT prover` + baked `r0vm`.
+`deploy/prover/` · `ghcr.io/drgora/por-prover`. Slim `debian:trixie-slim` image that bakes the
+prover + **both** r0vm servers (CPU and CUDA) and auto-selects at runtime (`entrypoint.sh` +
+`gpu-preflight`): with `--gpus all` on a host whose GPU has **≥16 GB free VRAM** it proves on
+the CUDA r0vm; otherwise it falls back to the CPU r0vm (same UX as before). The `prover` and its
+guest `image_id` are unchanged, so proofs are byte-identical — GPU only makes them faster.
 
 ```bash
-deploy/prover/build.sh                 # build   (PUSH=1 to also push)
+# Build: needs a CUDA r0vm 3.0.4 (rzup ships CPU-only). Build it from the risc0 monorepo:
+#   git clone https://github.com/risc0/risc0 && cd risc0 && git checkout v3.0.4
+#   NVCC_APPEND_FLAGS=-arch=<sm_XX> cargo build --release -p risc0-r0vm -F cuda  # CUDA 12.x
+R0VM_CUDA=/path/to/risc0/target/release/r0vm deploy/prover/build.sh   # PUSH=1 to also push
+#   (or SKIP_CUDA=1 deploy/prover/build.sh for a CPU-only fallback build)
+
+# Run — CPU (anywhere, unchanged):
 docker run --rm \
   -e POR_PRIVATE_KEY=<32B hex> \
   -e NOTARY_ADDR=hayabusa.proxy.rlwy.net:43686 \
   ghcr.io/drgora/por-prover:latest \
     --verifier https://verifier-production-d672.up.railway.app \
     --agent-id <id> --threshold <wei> --chain-id 1
+
+# Run — GPU (add --gpus all; requires ≥16 GB free VRAM):
+docker run --rm --gpus all -e POR_PRIVATE_KEY=<hex> ghcr.io/drgora/por-prover:latest ...
+
+# See which backend a host would pick, without proving:
+docker run --rm --gpus all ghcr.io/drgora/por-prover:latest --print-backend   # -> gpu | cpu
 ```
+
+Overrides: `POR_PROVER_BACKEND=auto|cpu|gpu` (force), `POR_MIN_VRAM_GB` (default 16). Detection
+uses the real CUDA driver + free-VRAM check (not `nvidia-smi`, which reports GPUs that can't
+actually prove), so an unusable or too-small GPU cleanly falls back to CPU instead of OOMing.
 
 ## `por-prove-web` — humans (browser wallet)
 
