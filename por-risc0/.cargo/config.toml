@@ -1,5 +1,11 @@
-# Host-only native codegen: lets the risc0 CPU prover (SHA-NI hashing, AVX-512
-# NTT/FRI) use this machine's extensions. Scoped to the x86_64 host target so the
-# riscv32im-risc0-zkvm-elf GUEST build is unaffected.
+# Host x86_64 codegen baseline for the SHIPPED binaries (prover/verifier/notary).
+# Use x86-64-v3 (AVX2/FMA/BMI) NOT `target-cpu=native`: native bakes THIS build box's
+# AVX-512, which SIGILLs ("illegal instruction") on any CPU without it (measured
+# 2026-07-10 on a non-AVX-512 server). v3 runs on ~every x86_64 CPU since ~2013 and
+# costs ~nothing here — the prover delegates proving to r0vm (external prover), which
+# ships separately and does its own runtime CPU-feature detection. Scoped to the x86_64
+# host target so the riscv32im-risc0-zkvm-elf GUEST (image_id) is unaffected.
+# For a faster LOCAL dev build on your own machine, override with
+# `RUSTFLAGS="-C target-cpu=native" cargo build …` (env overrides this file).
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
